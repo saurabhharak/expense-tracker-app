@@ -12,9 +12,7 @@ branch_labels = None
 depends_on = None
 
 def upgrade() -> None:
-    # System categories have user_id = NULL, is_system = true
     op.execute("""
-    -- ── EXPENSE categories ──
     INSERT INTO expense_tracker.categories (user_id, parent_id, name, type, icon, is_system, sort_order) VALUES
     (NULL, NULL, 'Food & Dining', 'expense', '🍽️', true, 1),
     (NULL, NULL, 'Transport', 'expense', '🚗', true, 2),
@@ -31,9 +29,10 @@ def upgrade() -> None:
     (NULL, NULL, 'Taxes', 'expense', '📋', true, 13),
     (NULL, NULL, 'Insurance', 'expense', '🛡️', true, 14),
     (NULL, NULL, 'Domestic Help', 'expense', '🏠', true, 15),
-    (NULL, NULL, 'Miscellaneous', 'expense', '📦', true, 16);
+    (NULL, NULL, 'Miscellaneous', 'expense', '📦', true, 16)
+    """)
 
-    -- Subcategories for Food & Dining
+    op.execute("""
     INSERT INTO expense_tracker.categories (user_id, parent_id, name, type, icon, is_system, sort_order)
     SELECT NULL, id, sub.name, 'expense', sub.icon, true, sub.sort_order
     FROM expense_tracker.categories parent,
@@ -41,9 +40,10 @@ def upgrade() -> None:
         ('Groceries', '🛒', 1), ('Restaurants', '🍴', 2),
         ('Swiggy / Zomato', '📱', 3), ('Chai / Snacks', '☕', 4)
     ) AS sub(name, icon, sort_order)
-    WHERE parent.name = 'Food & Dining' AND parent.parent_id IS NULL AND parent.is_system = true;
+    WHERE parent.name = 'Food & Dining' AND parent.parent_id IS NULL AND parent.is_system = true
+    """)
 
-    -- Subcategories for Transport
+    op.execute("""
     INSERT INTO expense_tracker.categories (user_id, parent_id, name, type, icon, is_system, sort_order)
     SELECT NULL, id, sub.name, 'expense', sub.icon, true, sub.sort_order
     FROM expense_tracker.categories parent,
@@ -51,9 +51,10 @@ def upgrade() -> None:
         ('Petrol / Diesel', '⛽', 1), ('Ola / Uber', '🚕', 2),
         ('Metro / Bus', '🚇', 3), ('Auto', '🛺', 4)
     ) AS sub(name, icon, sort_order)
-    WHERE parent.name = 'Transport' AND parent.parent_id IS NULL AND parent.is_system = true;
+    WHERE parent.name = 'Transport' AND parent.parent_id IS NULL AND parent.is_system = true
+    """)
 
-    -- Subcategories for Bills & Utilities
+    op.execute("""
     INSERT INTO expense_tracker.categories (user_id, parent_id, name, type, icon, is_system, sort_order)
     SELECT NULL, id, sub.name, 'expense', sub.icon, true, sub.sort_order
     FROM expense_tracker.categories parent,
@@ -62,9 +63,10 @@ def upgrade() -> None:
         ('Internet / WiFi', '🌐', 3), ('Gas', '🔥', 4),
         ('Water', '💧', 5), ('DTH', '📡', 6)
     ) AS sub(name, icon, sort_order)
-    WHERE parent.name = 'Bills & Utilities' AND parent.parent_id IS NULL AND parent.is_system = true;
+    WHERE parent.name = 'Bills & Utilities' AND parent.parent_id IS NULL AND parent.is_system = true
+    """)
 
-    -- ── INCOME categories ──
+    op.execute("""
     INSERT INTO expense_tracker.categories (user_id, parent_id, name, type, icon, is_system, sort_order) VALUES
     (NULL, NULL, 'Salary', 'income', '💰', true, 1),
     (NULL, NULL, 'Freelance / Consulting', 'income', '💻', true, 2),
@@ -74,8 +76,8 @@ def upgrade() -> None:
     (NULL, NULL, 'Rental Income', 'income', '🏠', true, 6),
     (NULL, NULL, 'Capital Gains', 'income', '📊', true, 7),
     (NULL, NULL, 'Cashback / Rewards', 'income', '🎯', true, 8),
-    (NULL, NULL, 'Other Income', 'income', '💵', true, 9);
+    (NULL, NULL, 'Other Income', 'income', '💵', true, 9)
     """)
 
 def downgrade() -> None:
-    op.execute("DELETE FROM expense_tracker.categories WHERE is_system = true;")
+    op.execute("DELETE FROM expense_tracker.categories WHERE is_system = true")

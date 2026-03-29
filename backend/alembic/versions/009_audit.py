@@ -25,21 +25,25 @@ def upgrade() -> None:
         user_agent      VARCHAR(512),
         metadata        JSONB,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
-
-    CREATE INDEX idx_audit_user_date ON expense_tracker.audit_logs (user_id, created_at DESC);
-    CREATE INDEX idx_audit_entity ON expense_tracker.audit_logs (entity_type, entity_id);
-
-    ALTER TABLE expense_tracker.audit_logs ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE expense_tracker.audit_logs FORCE ROW LEVEL SECURITY;
-
-    CREATE POLICY audit_logs_select ON expense_tracker.audit_logs FOR SELECT TO app_user
-        USING (user_id = expense_tracker.current_app_user_id());
-    CREATE POLICY audit_logs_insert ON expense_tracker.audit_logs FOR INSERT TO app_user
-        WITH CHECK (user_id = expense_tracker.current_app_user_id());
-
-    REVOKE UPDATE, DELETE ON expense_tracker.audit_logs FROM app_user;
+    )
     """)
 
+    op.execute("CREATE INDEX idx_audit_user_date ON expense_tracker.audit_logs (user_id, created_at DESC)")
+    op.execute("CREATE INDEX idx_audit_entity ON expense_tracker.audit_logs (entity_type, entity_id)")
+
+    op.execute("ALTER TABLE expense_tracker.audit_logs ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE expense_tracker.audit_logs FORCE ROW LEVEL SECURITY")
+
+    op.execute("""
+    CREATE POLICY audit_logs_select ON expense_tracker.audit_logs FOR SELECT TO app_user
+        USING (user_id = expense_tracker.current_app_user_id())
+    """)
+    op.execute("""
+    CREATE POLICY audit_logs_insert ON expense_tracker.audit_logs FOR INSERT TO app_user
+        WITH CHECK (user_id = expense_tracker.current_app_user_id())
+    """)
+
+    op.execute("REVOKE UPDATE, DELETE ON expense_tracker.audit_logs FROM app_user")
+
 def downgrade() -> None:
-    op.execute("DROP TABLE IF EXISTS expense_tracker.audit_logs CASCADE;")
+    op.execute("DROP TABLE IF EXISTS expense_tracker.audit_logs CASCADE")

@@ -13,16 +13,16 @@ depends_on = None
 
 def upgrade() -> None:
     op.execute("""
-    -- updated_at trigger function (reused by all tables)
     CREATE OR REPLACE FUNCTION expense_tracker.update_updated_at()
     RETURNS TRIGGER AS $$
     BEGIN
         NEW.updated_at = now();
         RETURN NEW;
     END;
-    $$ LANGUAGE plpgsql;
+    $$ LANGUAGE plpgsql
+    """)
 
-    -- ── USERS ──
+    op.execute("""
     CREATE TABLE expense_tracker.users (
         id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         email           VARCHAR(255) UNIQUE,
@@ -45,20 +45,25 @@ def upgrade() -> None:
         daily_api_cost_limit_paise INTEGER NOT NULL DEFAULT 500,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
+    """)
 
+    op.execute("""
     ALTER TABLE expense_tracker.users ADD CONSTRAINT chk_auth_method
-        CHECK (email IS NOT NULL OR phone IS NOT NULL OR google_id IS NOT NULL);
+        CHECK (email IS NOT NULL OR phone IS NOT NULL OR google_id IS NOT NULL)
+    """)
 
-    CREATE INDEX idx_users_email ON expense_tracker.users (email) WHERE email IS NOT NULL;
-    CREATE INDEX idx_users_phone ON expense_tracker.users (phone) WHERE phone IS NOT NULL;
-    CREATE INDEX idx_users_google_id ON expense_tracker.users (google_id) WHERE google_id IS NOT NULL;
+    op.execute("CREATE INDEX idx_users_email ON expense_tracker.users (email) WHERE email IS NOT NULL")
+    op.execute("CREATE INDEX idx_users_phone ON expense_tracker.users (phone) WHERE phone IS NOT NULL")
+    op.execute("CREATE INDEX idx_users_google_id ON expense_tracker.users (google_id) WHERE google_id IS NOT NULL")
 
+    op.execute("""
     CREATE TRIGGER trg_users_updated_at
         BEFORE UPDATE ON expense_tracker.users
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at()
+    """)
 
-    -- ── REFRESH TOKENS ──
+    op.execute("""
     CREATE TABLE expense_tracker.refresh_tokens (
         id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id         UUID NOT NULL REFERENCES expense_tracker.users(id) ON DELETE CASCADE,
@@ -69,16 +74,14 @@ def upgrade() -> None:
         replaced_by     UUID REFERENCES expense_tracker.refresh_tokens(id),
         user_agent      VARCHAR(512),
         ip_address      INET
-    );
-
-    CREATE INDEX idx_refresh_tokens_user_id ON expense_tracker.refresh_tokens (user_id);
-    CREATE INDEX idx_refresh_tokens_token_hash ON expense_tracker.refresh_tokens (token_hash) WHERE revoked_at IS NULL;
-    CREATE INDEX idx_refresh_tokens_expires ON expense_tracker.refresh_tokens (expires_at) WHERE revoked_at IS NULL;
+    )
     """)
+
+    op.execute("CREATE INDEX idx_refresh_tokens_user_id ON expense_tracker.refresh_tokens (user_id)")
+    op.execute("CREATE INDEX idx_refresh_tokens_token_hash ON expense_tracker.refresh_tokens (token_hash) WHERE revoked_at IS NULL")
+    op.execute("CREATE INDEX idx_refresh_tokens_expires ON expense_tracker.refresh_tokens (expires_at) WHERE revoked_at IS NULL")
 
 def downgrade() -> None:
-    op.execute("""
-    DROP TABLE IF EXISTS expense_tracker.refresh_tokens CASCADE;
-    DROP TABLE IF EXISTS expense_tracker.users CASCADE;
-    DROP FUNCTION IF EXISTS expense_tracker.update_updated_at();
-    """)
+    op.execute("DROP TABLE IF EXISTS expense_tracker.refresh_tokens CASCADE")
+    op.execute("DROP TABLE IF EXISTS expense_tracker.users CASCADE")
+    op.execute("DROP FUNCTION IF EXISTS expense_tracker.update_updated_at()")

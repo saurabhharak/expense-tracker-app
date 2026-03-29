@@ -15,8 +15,10 @@ def upgrade() -> None:
     op.execute("""
     CREATE TYPE expense_tracker.investment_type AS ENUM (
         'equity', 'mutual_fund', 'etf', 'fd', 'rd', 'ppf', 'nps', 'bond', 'gold'
-    );
+    )
+    """)
 
+    op.execute("""
     CREATE TABLE expense_tracker.investment_holdings (
         id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id         UUID NOT NULL REFERENCES expense_tracker.users(id) ON DELETE CASCADE,
@@ -38,26 +40,35 @@ def upgrade() -> None:
         is_active       BOOLEAN NOT NULL DEFAULT true,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
+    """)
 
-    CREATE INDEX idx_holdings_user ON expense_tracker.investment_holdings (user_id);
-    CREATE INDEX idx_holdings_user_type ON expense_tracker.investment_holdings (user_id, type);
-    CREATE INDEX idx_holdings_symbol ON expense_tracker.investment_holdings (symbol) WHERE symbol IS NOT NULL;
+    op.execute("CREATE INDEX idx_holdings_user ON expense_tracker.investment_holdings (user_id)")
+    op.execute("CREATE INDEX idx_holdings_user_type ON expense_tracker.investment_holdings (user_id, type)")
+    op.execute("CREATE INDEX idx_holdings_symbol ON expense_tracker.investment_holdings (symbol) WHERE symbol IS NOT NULL")
 
-    ALTER TABLE expense_tracker.investment_holdings ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE expense_tracker.investment_holdings FORCE ROW LEVEL SECURITY;
+    op.execute("ALTER TABLE expense_tracker.investment_holdings ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE expense_tracker.investment_holdings FORCE ROW LEVEL SECURITY")
+
+    op.execute("""
     CREATE POLICY holdings_all ON expense_tracker.investment_holdings FOR ALL TO app_user
         USING (user_id = expense_tracker.current_app_user_id())
-        WITH CHECK (user_id = expense_tracker.current_app_user_id());
+        WITH CHECK (user_id = expense_tracker.current_app_user_id())
+    """)
+
+    op.execute("""
     CREATE TRIGGER trg_holdings_updated_at
         BEFORE UPDATE ON expense_tracker.investment_holdings
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at()
+    """)
 
-    -- Investment Transactions
+    op.execute("""
     CREATE TYPE expense_tracker.investment_txn_type AS ENUM (
         'buy', 'sell', 'dividend', 'interest', 'split', 'bonus', 'sip'
-    );
+    )
+    """)
 
+    op.execute("""
     CREATE TABLE expense_tracker.investment_transactions (
         id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id         UUID NOT NULL REFERENCES expense_tracker.users(id) ON DELETE CASCADE,
@@ -79,30 +90,44 @@ def upgrade() -> None:
         is_deleted      BOOLEAN NOT NULL DEFAULT false,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
+    """)
 
-    CREATE INDEX idx_inv_txn_user ON expense_tracker.investment_transactions (user_id);
-    CREATE INDEX idx_inv_txn_holding ON expense_tracker.investment_transactions (holding_id, transaction_date DESC);
+    op.execute("CREATE INDEX idx_inv_txn_user ON expense_tracker.investment_transactions (user_id)")
+    op.execute("CREATE INDEX idx_inv_txn_holding ON expense_tracker.investment_transactions (holding_id, transaction_date DESC)")
+    op.execute("""
     CREATE INDEX idx_inv_txn_user_date ON expense_tracker.investment_transactions (user_id, transaction_date DESC)
-        WHERE is_deleted = false;
+        WHERE is_deleted = false
+    """)
 
-    ALTER TABLE expense_tracker.investment_transactions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE expense_tracker.investment_transactions FORCE ROW LEVEL SECURITY;
+    op.execute("ALTER TABLE expense_tracker.investment_transactions ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE expense_tracker.investment_transactions FORCE ROW LEVEL SECURITY")
+
+    op.execute("""
     CREATE POLICY inv_txn_all ON expense_tracker.investment_transactions FOR ALL TO app_user
         USING (user_id = expense_tracker.current_app_user_id())
-        WITH CHECK (user_id = expense_tracker.current_app_user_id());
+        WITH CHECK (user_id = expense_tracker.current_app_user_id())
+    """)
+
+    op.execute("""
     CREATE TRIGGER trg_inv_txn_updated_at
         BEFORE UPDATE ON expense_tracker.investment_transactions
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at()
+    """)
 
-    -- Bond Details
-    CREATE TYPE expense_tracker.coupon_frequency AS ENUM ('monthly', 'quarterly', 'semi_annual', 'annual', 'zero_coupon');
+    op.execute("""
+    CREATE TYPE expense_tracker.coupon_frequency AS ENUM ('monthly', 'quarterly', 'semi_annual', 'annual', 'zero_coupon')
+    """)
+
+    op.execute("""
     CREATE TYPE expense_tracker.credit_rating AS ENUM (
         'AAA', 'AA+', 'AA', 'AA-', 'A+', 'A', 'A-',
         'BBB+', 'BBB', 'BBB-', 'BB+', 'BB', 'BB-', 'B+', 'B', 'B-',
         'C', 'D', 'unrated', 'sovereign'
-    );
+    )
+    """)
 
+    op.execute("""
     CREATE TABLE expense_tracker.bond_details (
         id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         holding_id          UUID NOT NULL UNIQUE REFERENCES expense_tracker.investment_holdings(id) ON DELETE CASCADE,
@@ -123,27 +148,31 @@ def upgrade() -> None:
         ytm                 DECIMAL(5,2),
         created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
+    """)
 
-    CREATE INDEX idx_bond_details_holding ON expense_tracker.bond_details (holding_id);
+    op.execute("CREATE INDEX idx_bond_details_holding ON expense_tracker.bond_details (holding_id)")
 
-    ALTER TABLE expense_tracker.bond_details ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE expense_tracker.bond_details FORCE ROW LEVEL SECURITY;
+    op.execute("ALTER TABLE expense_tracker.bond_details ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE expense_tracker.bond_details FORCE ROW LEVEL SECURITY")
+
+    op.execute("""
     CREATE POLICY bond_details_all ON expense_tracker.bond_details FOR ALL TO app_user
         USING (user_id = expense_tracker.current_app_user_id())
-        WITH CHECK (user_id = expense_tracker.current_app_user_id());
+        WITH CHECK (user_id = expense_tracker.current_app_user_id())
+    """)
+
+    op.execute("""
     CREATE TRIGGER trg_bond_details_updated_at
         BEFORE UPDATE ON expense_tracker.bond_details
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at()
     """)
 
 def downgrade() -> None:
-    op.execute("""
-    DROP TABLE IF EXISTS expense_tracker.bond_details CASCADE;
-    DROP TABLE IF EXISTS expense_tracker.investment_transactions CASCADE;
-    DROP TABLE IF EXISTS expense_tracker.investment_holdings CASCADE;
-    DROP TYPE IF EXISTS expense_tracker.credit_rating;
-    DROP TYPE IF EXISTS expense_tracker.coupon_frequency;
-    DROP TYPE IF EXISTS expense_tracker.investment_txn_type;
-    DROP TYPE IF EXISTS expense_tracker.investment_type;
-    """)
+    op.execute("DROP TABLE IF EXISTS expense_tracker.bond_details CASCADE")
+    op.execute("DROP TABLE IF EXISTS expense_tracker.investment_transactions CASCADE")
+    op.execute("DROP TABLE IF EXISTS expense_tracker.investment_holdings CASCADE")
+    op.execute("DROP TYPE IF EXISTS expense_tracker.credit_rating")
+    op.execute("DROP TYPE IF EXISTS expense_tracker.coupon_frequency")
+    op.execute("DROP TYPE IF EXISTS expense_tracker.investment_txn_type")
+    op.execute("DROP TYPE IF EXISTS expense_tracker.investment_type")

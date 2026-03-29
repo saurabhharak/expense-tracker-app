@@ -15,8 +15,10 @@ def upgrade() -> None:
     op.execute("""
     CREATE TYPE expense_tracker.account_type AS ENUM (
         'savings', 'current', 'credit_card', 'wallet', 'cash', 'loan'
-    );
+    )
+    """)
 
+    op.execute("""
     CREATE TABLE expense_tracker.accounts (
         id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id         UUID NOT NULL REFERENCES expense_tracker.users(id) ON DELETE CASCADE,
@@ -33,26 +35,30 @@ def upgrade() -> None:
         sort_order      INTEGER NOT NULL DEFAULT 0,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
+    """)
 
-    CREATE INDEX idx_accounts_user_id ON expense_tracker.accounts (user_id);
+    op.execute("CREATE INDEX idx_accounts_user_id ON expense_tracker.accounts (user_id)")
+    op.execute("""
     CREATE UNIQUE INDEX idx_accounts_default
-        ON expense_tracker.accounts (user_id) WHERE is_default = true AND is_active = true;
+        ON expense_tracker.accounts (user_id) WHERE is_default = true AND is_active = true
+    """)
 
-    ALTER TABLE expense_tracker.accounts ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE expense_tracker.accounts FORCE ROW LEVEL SECURITY;
+    op.execute("ALTER TABLE expense_tracker.accounts ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE expense_tracker.accounts FORCE ROW LEVEL SECURITY")
 
+    op.execute("""
     CREATE POLICY accounts_all ON expense_tracker.accounts FOR ALL TO app_user
         USING (user_id = expense_tracker.current_app_user_id())
-        WITH CHECK (user_id = expense_tracker.current_app_user_id());
+        WITH CHECK (user_id = expense_tracker.current_app_user_id())
+    """)
 
+    op.execute("""
     CREATE TRIGGER trg_accounts_updated_at
         BEFORE UPDATE ON expense_tracker.accounts
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at()
     """)
 
 def downgrade() -> None:
-    op.execute("""
-    DROP TABLE IF EXISTS expense_tracker.accounts CASCADE;
-    DROP TYPE IF EXISTS expense_tracker.account_type;
-    """)
+    op.execute("DROP TABLE IF EXISTS expense_tracker.accounts CASCADE")
+    op.execute("DROP TYPE IF EXISTS expense_tracker.account_type")

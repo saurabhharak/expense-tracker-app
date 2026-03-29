@@ -12,9 +12,9 @@ branch_labels = None
 depends_on = None
 
 def upgrade() -> None:
-    op.execute("""
-    CREATE TYPE expense_tracker.transaction_type AS ENUM ('income', 'expense', 'transfer');
+    op.execute("CREATE TYPE expense_tracker.transaction_type AS ENUM ('income', 'expense', 'transfer')")
 
+    op.execute("""
     CREATE TABLE expense_tracker.transactions (
         id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id         UUID NOT NULL REFERENCES expense_tracker.users(id) ON DELETE CASCADE,
@@ -27,42 +27,56 @@ def upgrade() -> None:
         notes           TEXT,
         tags            TEXT[] DEFAULT '{}',
         transaction_date TIMESTAMPTZ NOT NULL DEFAULT now(),
-        -- FK columns without constraints (referenced tables don't exist yet)
         screenshot_parse_log_id UUID,
         recurring_transaction_id UUID,
         is_deleted      BOOLEAN NOT NULL DEFAULT false,
         deleted_at      TIMESTAMPTZ,
         created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-    );
+    )
+    """)
 
-    -- Indexes
+    op.execute("""
     CREATE INDEX idx_txn_user_date ON expense_tracker.transactions
-        (user_id, transaction_date DESC, id DESC) WHERE is_deleted = false;
+        (user_id, transaction_date DESC, id DESC) WHERE is_deleted = false
+    """)
+    op.execute("""
     CREATE INDEX idx_txn_user_account ON expense_tracker.transactions
-        (user_id, account_id, transaction_date DESC) WHERE is_deleted = false;
+        (user_id, account_id, transaction_date DESC) WHERE is_deleted = false
+    """)
+    op.execute("""
     CREATE INDEX idx_txn_user_category ON expense_tracker.transactions
-        (user_id, category_id, transaction_date DESC) WHERE is_deleted = false;
+        (user_id, category_id, transaction_date DESC) WHERE is_deleted = false
+    """)
+    op.execute("""
     CREATE INDEX idx_txn_user_type ON expense_tracker.transactions
-        (user_id, type, transaction_date DESC) WHERE is_deleted = false;
+        (user_id, type, transaction_date DESC) WHERE is_deleted = false
+    """)
+    op.execute("""
     CREATE INDEX idx_txn_user_type_date ON expense_tracker.transactions
-        (user_id, type, transaction_date) WHERE is_deleted = false;
+        (user_id, type, transaction_date) WHERE is_deleted = false
+    """)
+    op.execute("""
     CREATE INDEX idx_txn_tags ON expense_tracker.transactions
-        USING GIN (tags) WHERE is_deleted = false;
+        USING GIN (tags) WHERE is_deleted = false
+    """)
 
-    -- RLS
-    ALTER TABLE expense_tracker.transactions ENABLE ROW LEVEL SECURITY;
-    ALTER TABLE expense_tracker.transactions FORCE ROW LEVEL SECURITY;
+    op.execute("ALTER TABLE expense_tracker.transactions ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE expense_tracker.transactions FORCE ROW LEVEL SECURITY")
 
+    op.execute("""
     CREATE POLICY transactions_all ON expense_tracker.transactions FOR ALL TO app_user
         USING (user_id = expense_tracker.current_app_user_id())
-        WITH CHECK (user_id = expense_tracker.current_app_user_id());
+        WITH CHECK (user_id = expense_tracker.current_app_user_id())
+    """)
 
+    op.execute("""
     CREATE TRIGGER trg_transactions_updated_at
         BEFORE UPDATE ON expense_tracker.transactions
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at()
+    """)
 
-    -- Balance trigger (incremental account balance updates)
+    op.execute("""
     CREATE OR REPLACE FUNCTION expense_tracker.update_account_balance()
     RETURNS TRIGGER
     SECURITY DEFINER
@@ -133,17 +147,17 @@ def upgrade() -> None:
 
         RETURN COALESCE(NEW, OLD);
     END;
-    $$ LANGUAGE plpgsql;
+    $$ LANGUAGE plpgsql
+    """)
 
+    op.execute("""
     CREATE TRIGGER trg_update_account_balance
         AFTER INSERT OR UPDATE OR DELETE ON expense_tracker.transactions
-        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_account_balance();
+        FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_account_balance()
     """)
 
 def downgrade() -> None:
-    op.execute("""
-    DROP TRIGGER IF EXISTS trg_update_account_balance ON expense_tracker.transactions;
-    DROP FUNCTION IF EXISTS expense_tracker.update_account_balance();
-    DROP TABLE IF EXISTS expense_tracker.transactions CASCADE;
-    DROP TYPE IF EXISTS expense_tracker.transaction_type;
-    """)
+    op.execute("DROP TRIGGER IF EXISTS trg_update_account_balance ON expense_tracker.transactions")
+    op.execute("DROP FUNCTION IF EXISTS expense_tracker.update_account_balance()")
+    op.execute("DROP TABLE IF EXISTS expense_tracker.transactions CASCADE")
+    op.execute("DROP TYPE IF EXISTS expense_tracker.transaction_type")
