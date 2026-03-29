@@ -81,6 +81,8 @@ def upgrade() -> None:
     ALTER TABLE expense_tracker.api_usage FORCE ROW LEVEL SECURITY;
     CREATE POLICY api_usage_select ON expense_tracker.api_usage FOR SELECT TO app_user
         USING (user_id = expense_tracker.current_app_user_id());
+    CREATE POLICY api_usage_insert ON expense_tracker.api_usage FOR INSERT TO app_user
+        WITH CHECK (user_id = expense_tracker.current_app_user_id());
     CREATE TRIGGER trg_api_usage_updated_at
         BEFORE UPDATE ON expense_tracker.api_usage
         FOR EACH ROW EXECUTE FUNCTION expense_tracker.update_updated_at();

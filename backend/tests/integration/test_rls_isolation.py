@@ -40,12 +40,15 @@ def setup_test_users():
             "id_b": USER_B_ID, "email_b": f"userb_{USER_B_ID[:8]}@test.com",
         })
 
-        # Create accounts for each user
+        # Create accounts for each user; capture the IDs for use in transactions
+        account_ids = {}
         for user_id, name in [(USER_A_ID, "A Savings"), (USER_B_ID, "B Savings")]:
+            acct_id = str(uuid.uuid4())
+            account_ids[user_id] = acct_id
             session.execute(text("""
                 INSERT INTO accounts (id, user_id, name, type, balance)
-                VALUES (uuid_generate_v4(), :uid, :name, 'savings', 10000)
-            """), {"uid": user_id, "name": name})
+                VALUES (:aid, :uid, :name, 'savings', 10000)
+            """), {"aid": acct_id, "uid": user_id, "name": name})
 
         # Create categories for each user
         for user_id, name in [(USER_A_ID, "A Food"), (USER_B_ID, "B Food")]:
@@ -61,20 +64,75 @@ def setup_test_users():
                 VALUES (:uid, 50000, 2026)
             """), {"uid": user_id})
 
-        # Create investment holdings for each user
+        # Create investment holdings for each user; capture IDs for child tables
+        holding_ids = {}
         for user_id, name in [(USER_A_ID, "A HDFC"), (USER_B_ID, "B SBI")]:
+            holding_id = str(uuid.uuid4())
+            holding_ids[user_id] = holding_id
             session.execute(text("""
-                INSERT INTO investment_holdings (user_id, type, name, quantity, avg_buy_price)
-                VALUES (:uid, 'equity', :name, 10, 1500)
-            """), {"uid": user_id, "name": name})
+                INSERT INTO investment_holdings (id, user_id, type, name, quantity, avg_buy_price)
+                VALUES (:hid, :uid, 'equity', :name, 10, 1500)
+            """), {"hid": holding_id, "uid": user_id, "name": name})
+
+        # Create transactions for each user
+        for user_id in [USER_A_ID, USER_B_ID]:
+            session.execute(text("""
+                INSERT INTO transactions (user_id, account_id, type, amount, transaction_date)
+                VALUES (:uid, :aid, 'expense', 100.00, now())
+            """), {"uid": user_id, "aid": account_ids[user_id]})
+
+        # Create recurring_transactions for each user
+        for user_id in [USER_A_ID, USER_B_ID]:
+            session.execute(text("""
+                INSERT INTO recurring_transactions
+                    (user_id, account_id, type, amount, frequency, start_date, next_due_date)
+                VALUES (:uid, :aid, 'expense', 500.00, 'monthly', '2026-01-01', '2026-04-01')
+            """), {"uid": user_id, "aid": account_ids[user_id]})
+
+        # Create investment_transactions for each user (requires holding_id)
+        for user_id in [USER_A_ID, USER_B_ID]:
+            session.execute(text("""
+                INSERT INTO investment_transactions
+                    (user_id, holding_id, type, quantity, price_per_unit, amount, transaction_date)
+                VALUES (:uid, :hid, 'buy', 5, 1500.00, 7500.00, '2026-01-15')
+            """), {"uid": user_id, "hid": holding_ids[user_id]})
+
+        # Create bond_details for each user (requires holding_id, unique per holding)
+        for user_id in [USER_A_ID, USER_B_ID]:
+            session.execute(text("""
+                INSERT INTO bond_details
+                    (holding_id, user_id, face_value, coupon_frequency, maturity_date)
+                VALUES (:hid, :uid, 1000.00, 'semi_annual', '2031-01-01')
+            """), {"uid": user_id, "hid": holding_ids[user_id]})
+
+        # Create screenshot_parse_logs for each user
+        for user_id in [USER_A_ID, USER_B_ID]:
+            session.execute(text("""
+                INSERT INTO screenshot_parse_logs
+                    (user_id, s3_key, file_size_bytes, mime_type, status)
+                VALUES (:uid, :s3key, 12345, 'image/jpeg', 'uploaded')
+            """), {"uid": user_id, "s3key": f"uploads/{user_id[:8]}/test.jpg"})
+
+        # Create api_usage for each user
+        for user_id in [USER_A_ID, USER_B_ID]:
+            session.execute(text("""
+                INSERT INTO api_usage (user_id, date, screenshot_count)
+                VALUES (:uid, CURRENT_DATE, 1)
+            """), {"uid": user_id})
 
         session.commit()
 
     yield
 
-    # Cleanup
+    # Cleanup in correct dependency order (children before parents)
     with SessionLocal() as session:
         session.execute(text("SET search_path TO expense_tracker, public"))
+        session.execute(text("DELETE FROM api_usage WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
+        session.execute(text("DELETE FROM screenshot_parse_logs WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
+        session.execute(text("DELETE FROM bond_details WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
+        session.execute(text("DELETE FROM investment_transactions WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
+        session.execute(text("DELETE FROM transactions WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
+        session.execute(text("DELETE FROM recurring_transactions WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
         session.execute(text("DELETE FROM budgets WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
         session.execute(text("DELETE FROM investment_holdings WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
         session.execute(text("DELETE FROM categories WHERE user_id IN (:a, :b)"), {"a": USER_A_ID, "b": USER_B_ID})
@@ -105,7 +163,18 @@ def _query_without_context(table: str) -> list:
     return rows
 
 
-RLS_TABLES = ["accounts", "categories", "budgets", "investment_holdings"]
+RLS_TABLES = [
+    "accounts",
+    "categories",
+    "budgets",
+    "investment_holdings",
+    "transactions",
+    "recurring_transactions",
+    "investment_transactions",
+    "bond_details",
+    "screenshot_parse_logs",
+    "api_usage",
+]
 
 
 @pytest.mark.parametrize("table", RLS_TABLES)
@@ -124,7 +193,18 @@ def test_user_b_sees_only_own_data(table):
     assert USER_A_ID not in user_ids, f"User B must NOT see User A's data in {table}"
 
 
-@pytest.mark.parametrize("table", ["accounts", "budgets", "investment_holdings"])
+# Exclude categories because system rows (user_id IS NULL) are visible without context
+@pytest.mark.parametrize("table", [
+    "accounts",
+    "budgets",
+    "investment_holdings",
+    "transactions",
+    "recurring_transactions",
+    "investment_transactions",
+    "bond_details",
+    "screenshot_parse_logs",
+    "api_usage",
+])
 def test_no_context_returns_no_rows(table):
     """Without RLS context, no rows should be visible (fail-closed)."""
     rows = _query_without_context(table)

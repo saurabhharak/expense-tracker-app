@@ -64,7 +64,10 @@ def upgrade() -> None:
 
     -- Balance trigger (incremental account balance updates)
     CREATE OR REPLACE FUNCTION expense_tracker.update_account_balance()
-    RETURNS TRIGGER AS $$
+    RETURNS TRIGGER
+    SECURITY DEFINER
+    SET search_path = expense_tracker
+    AS $$
     DECLARE
         v_delta DECIMAL(14,2);
     BEGIN
