@@ -347,7 +347,7 @@ expense-tracker/
 │  Stored: In-memory (Zustand)     Stored: httpOnly cookie     │
 │  Lifetime: 15 minutes            Lifetime: 30 days           │
 │  Payload: {user_id, email}       Stored in DB: yes           │
-│  Signed: HS256                   Format: 64-char hex         │
+│  Signed: RS256                   Format: 64-char hex         │
 │  Sent: Authorization header      Sent: Cookie (auto)         │
 │                                                              │
 │  On 401 → POST /auth/refresh → New access token             │
@@ -394,7 +394,7 @@ User clicks "Sign in with Google"
 
 ```
 POST /auth/otp/request  { phone: "+919876543210" }
-  → Rate limit: 3 requests per phone per hour
+  → Rate limit: 3 requests per 10 minutes per phone
   → Generate 6-digit OTP
   → Store in Redis: otp:{phone} = {otp, attempts: 0} TTL 300s
   → Send via MSG91 Transactional SMS API
@@ -423,8 +423,36 @@ RLS is the **primary** isolation mechanism. Even if application code has a bug t
 ```python
 # core/database.py
 
-from contextlib import asynccontextmanager
-from sqlalchemy.ext.asyncio import AsyncSession
+from contextlib import asynccontextmanager, contextmanager
+from sqlalchemy import create_engine, text
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.orm import sessionmaker, Session
+from app.core.config import settings
+
+# ── Async engine (FastAPI) ──
+# Uses asyncpg driver for non-blocking I/O in async FastAPI routes.
+async_engine = create_async_engine(
+    settings.DATABASE_URL,  # postgresql+asyncpg://...
+    pool_size=20,
+    max_overflow=10,
+    pool_pre_ping=True,
+    # Required for PgBouncer transaction mode: disable prepared statement cache
+    connect_args={"prepared_statement_cache_size": 0},
+)
+async_session_factory = async_sessionmaker(async_engine, expire_on_commit=False)
+
+# ── Sync engine (Celery workers) ──
+# Uses psycopg2 (default) driver for synchronous Celery tasks.
+# Celery tasks are synchronous; using async engine here would require
+# an event loop per task, adding complexity for no benefit.
+sync_engine = create_engine(
+    settings.SYNC_DATABASE_URL,  # postgresql://... (no asyncpg)
+    pool_size=10,
+    max_overflow=5,
+    pool_pre_ping=True,
+)
+sync_session_factory = sessionmaker(sync_engine, expire_on_commit=False)
+
 
 @asynccontextmanager
 async def get_db_session(user_id: str | None = None):
@@ -432,6 +460,7 @@ async def get_db_session(user_id: str | None = None):
     Yields an AsyncSession with RLS context set.
     Every query within this session is automatically filtered
     by the user's ID at the database level.
+    Used by FastAPI route handlers.
     """
     async with async_session_factory() as session:
         async with session.begin():
@@ -444,6 +473,49 @@ async def get_db_session(user_id: str | None = None):
                     {"uid": user_id}
                 )
             yield session
+
+
+@contextmanager
+def sync_db_session(user_id: str | None = None):
+    """
+    Yields a sync Session with RLS context set.
+    Used by Celery tasks that run synchronously.
+    """
+    session: Session = sync_session_factory()
+    try:
+        session.begin()
+        if user_id:
+            session.execute(
+                text("SET LOCAL app.current_user_id = :uid"),
+                {"uid": user_id}
+            )
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@contextmanager
+def sync_db_session_as_admin():
+    """
+    Yields a sync Session WITHOUT RLS context.
+    Used by Celery tasks that need to operate across all users
+    (e.g., recurring transaction generation, nightly reconciliation).
+    The admin role bypasses RLS policies.
+    """
+    session: Session = sync_session_factory()
+    try:
+        session.begin()
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
 ```
 
 **Dependency injection in routes:**
@@ -472,10 +544,10 @@ async def get_db(user_id: str = Depends(get_current_user)):
 |-----------------|-------|--------|-----|
 | `POST /auth/register` | 5 | per hour | IP |
 | `POST /auth/login` | 10 | per minute | IP |
-| `POST /auth/otp/request` | 3 | per hour | phone number |
+| `POST /auth/otp/request` | 3 | per 10 minutes | phone number |
 | `POST /auth/otp/verify` | 5 attempts | per OTP | phone number |
 | `POST /auth/refresh` | 30 | per minute | user_id |
-| `POST /screenshots/upload` | 50 | per day | user_id |
+| `POST /screenshots/upload` | 10/hour AND 50/day | per hour / per day | user_id |
 | All other authenticated | 200 | per minute | user_id |
 
 **Implementation:** Redis sliding window (sorted set with timestamps).
@@ -665,6 +737,7 @@ CREATE INDEX idx_categories_parent_id ON categories (parent_id);
 
 -- RLS: users see system categories (user_id IS NULL) + their own
 ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE categories FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY categories_select ON categories FOR SELECT TO app_user
     USING (user_id IS NULL OR user_id = current_app_user_id());
@@ -794,6 +867,7 @@ CREATE UNIQUE INDEX idx_accounts_default
     ON accounts (user_id) WHERE is_default = true AND is_active = true;
 
 ALTER TABLE accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE accounts FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY accounts_all ON accounts FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -876,6 +950,7 @@ CREATE INDEX idx_txn_tags ON transactions USING GIN (tags)
 -- TRANSACTION RLS
 -- ============================================================
 ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY transactions_all ON transactions FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -886,53 +961,111 @@ CREATE TRIGGER trg_transactions_updated_at
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
 -- ============================================================
--- ACCOUNT BALANCE TRIGGER
+-- ACCOUNT BALANCE TRIGGER (incremental)
 -- ============================================================
--- Automatically update account balance when transactions are inserted/updated/deleted.
+-- Incrementally adjust account balance on INSERT/UPDATE/DELETE
+-- instead of recalculating by summing ALL transactions (O(1) vs O(n)).
 CREATE OR REPLACE FUNCTION update_account_balance()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_delta DECIMAL(14,2);
 BEGIN
-    -- Recalculate balance for the affected account(s)
-    IF TG_OP = 'INSERT' OR TG_OP = 'UPDATE' THEN
-        UPDATE accounts SET balance = (
-            SELECT COALESCE(SUM(
-                CASE
-                    WHEN t.type = 'income' THEN t.amount
-                    WHEN t.type = 'expense' THEN -t.amount
-                    WHEN t.type = 'transfer' AND t.account_id = NEW.account_id THEN -t.amount
-                    WHEN t.type = 'transfer' AND t.to_account_id = NEW.account_id THEN t.amount
-                    ELSE 0
-                END
-            ), 0)
-            FROM transactions t
-            WHERE t.account_id = NEW.account_id OR t.to_account_id = NEW.account_id
-            AND t.is_deleted = false
-        )
-        WHERE id = NEW.account_id;
+    -- ── DELETE: reverse the old transaction's effect ──
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.is_deleted = false THEN
+            -- Reverse effect on source account
+            v_delta := CASE
+                WHEN OLD.type = 'income'   THEN -OLD.amount
+                WHEN OLD.type = 'expense'  THEN  OLD.amount
+                WHEN OLD.type = 'transfer' THEN  OLD.amount
+                ELSE 0
+            END;
+            UPDATE accounts SET balance = balance + v_delta WHERE id = OLD.account_id;
 
-        -- Handle transfer destination account
-        IF NEW.type = 'transfer' AND NEW.to_account_id IS NOT NULL THEN
-            UPDATE accounts SET balance = (
-                SELECT COALESCE(SUM(
-                    CASE
-                        WHEN t.type = 'income' THEN t.amount
-                        WHEN t.type = 'expense' THEN -t.amount
-                        WHEN t.type = 'transfer' AND t.account_id = NEW.to_account_id THEN -t.amount
-                        WHEN t.type = 'transfer' AND t.to_account_id = NEW.to_account_id THEN t.amount
-                        ELSE 0
-                    END
-                ), 0)
-                FROM transactions t
-                WHERE t.account_id = NEW.to_account_id OR t.to_account_id = NEW.to_account_id
-                AND t.is_deleted = false
-            )
-            WHERE id = NEW.to_account_id;
+            -- Reverse effect on destination account (transfers)
+            IF OLD.type = 'transfer' AND OLD.to_account_id IS NOT NULL THEN
+                UPDATE accounts SET balance = balance - OLD.amount WHERE id = OLD.to_account_id;
+            END IF;
         END IF;
+        RETURN OLD;
+    END IF;
+
+    -- ── INSERT: apply the new transaction's effect ──
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.is_deleted = false THEN
+            v_delta := CASE
+                WHEN NEW.type = 'income'   THEN  NEW.amount
+                WHEN NEW.type = 'expense'  THEN -NEW.amount
+                WHEN NEW.type = 'transfer' THEN -NEW.amount
+                ELSE 0
+            END;
+            UPDATE accounts SET balance = balance + v_delta WHERE id = NEW.account_id;
+
+            IF NEW.type = 'transfer' AND NEW.to_account_id IS NOT NULL THEN
+                UPDATE accounts SET balance = balance + NEW.amount WHERE id = NEW.to_account_id;
+            END IF;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    -- ── UPDATE: reverse old effect, then apply new effect ──
+    IF TG_OP = 'UPDATE' THEN
+        -- Reverse OLD (if it was not soft-deleted)
+        IF OLD.is_deleted = false THEN
+            v_delta := CASE
+                WHEN OLD.type = 'income'   THEN -OLD.amount
+                WHEN OLD.type = 'expense'  THEN  OLD.amount
+                WHEN OLD.type = 'transfer' THEN  OLD.amount
+                ELSE 0
+            END;
+            UPDATE accounts SET balance = balance + v_delta WHERE id = OLD.account_id;
+
+            IF OLD.type = 'transfer' AND OLD.to_account_id IS NOT NULL THEN
+                UPDATE accounts SET balance = balance - OLD.amount WHERE id = OLD.to_account_id;
+            END IF;
+        END IF;
+
+        -- Apply NEW (if it is not soft-deleted)
+        IF NEW.is_deleted = false THEN
+            v_delta := CASE
+                WHEN NEW.type = 'income'   THEN  NEW.amount
+                WHEN NEW.type = 'expense'  THEN -NEW.amount
+                WHEN NEW.type = 'transfer' THEN -NEW.amount
+                ELSE 0
+            END;
+            UPDATE accounts SET balance = balance + v_delta WHERE id = NEW.account_id;
+
+            IF NEW.type = 'transfer' AND NEW.to_account_id IS NOT NULL THEN
+                UPDATE accounts SET balance = balance + NEW.amount WHERE id = NEW.to_account_id;
+            END IF;
+        END IF;
+        RETURN NEW;
     END IF;
 
     RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
+
+-- ── Nightly reconciliation (run via Celery Beat at 2:30 AM IST) ──
+-- Corrects any drift between incremental trigger updates and actual totals.
+-- SELECT a.id, a.balance AS current_balance, COALESCE(calc.expected, 0) AS expected_balance
+-- FROM accounts a
+-- LEFT JOIN LATERAL (
+--     SELECT SUM(
+--         CASE
+--             WHEN t.type = 'income' AND t.account_id = a.id THEN t.amount
+--             WHEN t.type = 'expense' AND t.account_id = a.id THEN -t.amount
+--             WHEN t.type = 'transfer' AND t.account_id = a.id THEN -t.amount
+--             WHEN t.type = 'transfer' AND t.to_account_id = a.id THEN t.amount
+--             ELSE 0
+--         END
+--     ) AS expected
+--     FROM transactions t
+--     WHERE (t.account_id = a.id OR t.to_account_id = a.id)
+--       AND t.is_deleted = false
+-- ) calc ON true
+-- WHERE a.balance <> COALESCE(calc.expected, 0);
+-- Then: UPDATE accounts SET balance = expected WHERE id = a.id;
 
 CREATE TRIGGER trg_update_account_balance
     AFTER INSERT OR UPDATE OR DELETE ON transactions
@@ -982,6 +1115,7 @@ CREATE INDEX idx_recurring_next_due ON recurring_transactions (next_due_date)
     WHERE is_active = true;
 
 ALTER TABLE recurring_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE recurring_transactions FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY recurring_all ON recurring_transactions FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -1028,6 +1162,7 @@ CREATE UNIQUE INDEX idx_budgets_unique
 CREATE INDEX idx_budgets_user_fy ON budgets (user_id, fy_year);
 
 ALTER TABLE budgets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE budgets FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY budgets_all ON budgets FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -1118,6 +1253,7 @@ CREATE INDEX idx_holdings_user_type ON investment_holdings (user_id, type);
 CREATE INDEX idx_holdings_symbol ON investment_holdings (symbol) WHERE symbol IS NOT NULL;
 
 ALTER TABLE investment_holdings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE investment_holdings FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY holdings_all ON investment_holdings FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -1174,6 +1310,7 @@ CREATE INDEX idx_inv_txn_user_date ON investment_transactions (user_id, transact
     WHERE is_deleted = false;
 
 ALTER TABLE investment_transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE investment_transactions FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY inv_txn_all ON investment_transactions FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -1229,6 +1366,7 @@ CREATE TABLE bond_details (
 CREATE INDEX idx_bond_details_holding ON bond_details (holding_id);
 
 ALTER TABLE bond_details ENABLE ROW LEVEL SECURITY;
+ALTER TABLE bond_details FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY bond_details_all ON bond_details FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -1268,7 +1406,8 @@ CREATE TABLE screenshot_parse_logs (
     status          parse_status NOT NULL DEFAULT 'uploaded',
 
     -- Claude API details
-    claude_model    VARCHAR(50),                       -- e.g., "claude-sonnet-4-20250514"
+    provider        VARCHAR(20),                       -- "anthropic" | "openai" | "google"
+    model_used      VARCHAR(50),                       -- e.g., "claude-sonnet-4-20250514"
     claude_request_id VARCHAR(100),
     input_tokens    INTEGER,
     output_tokens   INTEGER,
@@ -1312,6 +1451,7 @@ CREATE INDEX idx_parse_logs_user ON screenshot_parse_logs (user_id, created_at D
 CREATE INDEX idx_parse_logs_status ON screenshot_parse_logs (status) WHERE status IN ('uploaded', 'processing');
 
 ALTER TABLE screenshot_parse_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE screenshot_parse_logs FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY parse_logs_all ON screenshot_parse_logs FOR ALL TO app_user
     USING (user_id = current_app_user_id())
@@ -1347,6 +1487,7 @@ CREATE TABLE api_usage (
 CREATE UNIQUE INDEX idx_api_usage_user_date ON api_usage (user_id, date);
 
 ALTER TABLE api_usage ENABLE ROW LEVEL SECURITY;
+ALTER TABLE api_usage FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY api_usage_select ON api_usage FOR SELECT TO app_user
     USING (user_id = current_app_user_id());
@@ -1366,8 +1507,8 @@ CREATE TRIGGER trg_api_usage_updated_at
 -- AUDIT LOGS (immutable, INSERT-only)
 -- ============================================================
 CREATE TABLE audit_logs (
-    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    id              BIGSERIAL PRIMARY KEY,              -- BIGSERIAL for high-volume append-only table
+    user_id         UUID REFERENCES users(id) ON DELETE SET NULL,  -- Nullable: supports system-initiated actions
 
     action          VARCHAR(50) NOT NULL,              -- e.g., 'transaction.create', 'budget.update'
     entity_type     VARCHAR(50) NOT NULL,              -- e.g., 'transaction', 'account'
@@ -1378,8 +1519,9 @@ CREATE TABLE audit_logs (
     new_values      JSONB,                             -- New state (NULL for deletes)
 
     -- Context
-    ip_address      INET,
-    user_agent      VARCHAR(512),
+    ip_address      INET,                              -- Client IP address
+    user_agent      VARCHAR(512),                      -- Client user agent string
+    metadata        JSONB,                             -- Additional context (request_id, source, etc.)
 
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
     -- No updated_at: audit logs are immutable
@@ -1392,6 +1534,7 @@ CREATE INDEX idx_audit_user_date ON audit_logs (user_id, created_at DESC);
 CREATE INDEX idx_audit_entity ON audit_logs (entity_type, entity_id);
 
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
 
 -- Users can only read their own audit logs, never modify
 CREATE POLICY audit_logs_select ON audit_logs FOR SELECT TO app_user
@@ -1545,16 +1688,16 @@ LIMIT 26;
 
 | Method | Path | Auth | Rate Limit | Description |
 |--------|------|------|------------|-------------|
-| `POST` | `/auth/register` | No | 5/hr/IP | Register with email + password |
-| `POST` | `/auth/login` | No | 10/min/IP | Login with email + password |
-| `GET` | `/auth/google` | No | - | Get Google OAuth authorization URL |
-| `GET` | `/auth/google/callback` | No | - | Google OAuth callback (exchanges code for tokens) |
-| `POST` | `/auth/otp/request` | No | 3/hr/phone | Request OTP to phone number |
-| `POST` | `/auth/otp/verify` | No | 5/OTP | Verify OTP and get tokens |
-| `POST` | `/auth/refresh` | Cookie | 30/min/user | Refresh access token using refresh token cookie |
-| `POST` | `/auth/logout` | Yes | - | Revoke refresh token, clear cookie |
+| `POST` | `/api/v1/auth/register` | No | 5/hr/IP | Register with email + password |
+| `POST` | `/api/v1/auth/login` | No | 10/min/IP | Login with email + password |
+| `GET` | `/api/v1/auth/google` | No | - | Get Google OAuth authorization URL |
+| `GET` | `/api/v1/auth/google/callback` | No | - | Google OAuth callback (exchanges code for tokens) |
+| `POST` | `/api/v1/auth/otp/request` | No | 3/10min/phone | Request OTP to phone number |
+| `POST` | `/api/v1/auth/otp/verify` | No | 5/OTP | Verify OTP and get tokens |
+| `POST` | `/api/v1/auth/refresh` | Cookie | 30/min/user | Refresh access token using refresh token cookie |
+| `POST` | `/api/v1/auth/logout` | Yes | - | Revoke refresh token, clear cookie |
 
-**`POST /auth/register`**
+**`POST /api/v1/auth/register`**
 
 ```
 Request:
@@ -1575,7 +1718,7 @@ Response (201):
 + Set-Cookie: refresh_token=...; HttpOnly; Secure; SameSite=Strict; Path=/auth; Max-Age=2592000
 ```
 
-**`POST /auth/login`**
+**`POST /api/v1/auth/login`**
 
 ```
 Request:
@@ -1599,24 +1742,24 @@ Response (200):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/users/me` | Yes | Get current user profile |
-| `PATCH` | `/users/me` | Yes | Update profile (name, preferences) |
-| `DELETE` | `/users/me` | Yes | Soft-delete account (requires password/OTP confirmation) |
-| `POST` | `/users/me/export` | Yes | Request data export (async, returns job ID) |
-| `GET` | `/users/me/export/{job_id}` | Yes | Check export status, get download URL |
-| `GET` | `/users/me/usage` | Yes | Get API usage stats (current day, current month) |
+| `GET` | `/api/v1/users/me` | Yes | Get current user profile |
+| `PATCH` | `/api/v1/users/me` | Yes | Update profile (name, preferences) |
+| `DELETE` | `/api/v1/users/me` | Yes | Soft-delete account (requires password/OTP confirmation) |
+| `POST` | `/api/v1/users/me/export` | Yes | Request data export (async, returns job ID) |
+| `GET` | `/api/v1/users/me/export/{job_id}` | Yes | Check export status, get download URL |
+| `GET` | `/api/v1/users/me/usage` | Yes | Get API usage stats (current day, current month) |
 
 #### Accounts
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/accounts` | Yes | List all accounts with balances |
-| `POST` | `/accounts` | Yes | Create new account |
-| `GET` | `/accounts/{id}` | Yes | Get account details |
-| `PATCH` | `/accounts/{id}` | Yes | Update account |
-| `DELETE` | `/accounts/{id}` | Yes | Deactivate account (fails if has transactions) |
+| `GET` | `/api/v1/accounts` | Yes | List all accounts with balances |
+| `POST` | `/api/v1/accounts` | Yes | Create new account |
+| `GET` | `/api/v1/accounts/{id}` | Yes | Get account details |
+| `PATCH` | `/api/v1/accounts/{id}` | Yes | Update account |
+| `DELETE` | `/api/v1/accounts/{id}` | Yes | Deactivate account (fails if has transactions) |
 
-**`POST /accounts`**
+**`POST /api/v1/accounts`**
 
 ```
 Request:
@@ -1648,12 +1791,12 @@ Response (201):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/categories` | Yes | List all categories (system + user, as tree) |
-| `POST` | `/categories` | Yes | Create custom category |
-| `PATCH` | `/categories/{id}` | Yes | Update custom category (cannot modify system) |
-| `DELETE` | `/categories/{id}` | Yes | Delete custom category (cannot delete system) |
+| `GET` | `/api/v1/categories` | Yes | List all categories (system + user, as tree) |
+| `POST` | `/api/v1/categories` | Yes | Create custom category |
+| `PATCH` | `/api/v1/categories/{id}` | Yes | Update custom category (cannot modify system) |
+| `DELETE` | `/api/v1/categories/{id}` | Yes | Delete custom category (cannot delete system) |
 
-**`GET /categories`** returns a tree structure:
+**`GET /api/v1/categories`** returns a tree structure:
 
 ```json
 {
@@ -1678,13 +1821,13 @@ Response (201):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/transactions` | Yes | List transactions (cursor paginated, filterable) |
-| `POST` | `/transactions` | Yes | Create transaction |
-| `GET` | `/transactions/{id}` | Yes | Get transaction details |
-| `PATCH` | `/transactions/{id}` | Yes | Update transaction |
-| `DELETE` | `/transactions/{id}` | Yes | Soft-delete transaction |
+| `GET` | `/api/v1/transactions` | Yes | List transactions (cursor paginated, filterable) |
+| `POST` | `/api/v1/transactions` | Yes | Create transaction |
+| `GET` | `/api/v1/transactions/{id}` | Yes | Get transaction details |
+| `PATCH` | `/api/v1/transactions/{id}` | Yes | Update transaction |
+| `DELETE` | `/api/v1/transactions/{id}` | Yes | Soft-delete transaction |
 
-**`GET /transactions` Query Parameters:**
+**`GET /api/v1/transactions` Query Parameters:**
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -1700,7 +1843,7 @@ Response (201):
 | `tags` | string | null | Comma-separated tags (AND logic) |
 | `search` | string | null | Search in description (ILIKE) |
 
-**`POST /transactions`**
+**`POST /api/v1/transactions`**
 
 ```
 Request:
@@ -1735,38 +1878,38 @@ Response (201):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/recurring` | Yes | List recurring transactions |
-| `POST` | `/recurring` | Yes | Create recurring transaction |
-| `GET` | `/recurring/{id}` | Yes | Get recurring transaction details |
-| `PATCH` | `/recurring/{id}` | Yes | Update recurring transaction |
-| `DELETE` | `/recurring/{id}` | Yes | Deactivate recurring transaction |
+| `GET` | `/api/v1/recurring` | Yes | List recurring transactions |
+| `POST` | `/api/v1/recurring` | Yes | Create recurring transaction |
+| `GET` | `/api/v1/recurring/{id}` | Yes | Get recurring transaction details |
+| `PATCH` | `/api/v1/recurring/{id}` | Yes | Update recurring transaction |
+| `DELETE` | `/api/v1/recurring/{id}` | Yes | Deactivate recurring transaction |
 
 #### Budgets
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/budgets` | Yes | List budgets for current FY |
-| `GET` | `/budgets?fy_year=2025` | Yes | List budgets for specific FY |
-| `POST` | `/budgets` | Yes | Create budget |
-| `PATCH` | `/budgets/{id}` | Yes | Update budget |
-| `DELETE` | `/budgets/{id}` | Yes | Delete budget |
+| `GET` | `/api/v1/budgets` | Yes | List budgets for current FY |
+| `GET` | `/api/v1/budgets?fy_year=2025` | Yes | List budgets for specific FY |
+| `POST` | `/api/v1/budgets` | Yes | Create budget |
+| `PATCH` | `/api/v1/budgets/{id}` | Yes | Update budget |
+| `DELETE` | `/api/v1/budgets/{id}` | Yes | Delete budget |
 
 #### Investments
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/investments/holdings` | Yes | List all holdings with current values |
-| `POST` | `/investments/holdings` | Yes | Add new holding |
-| `GET` | `/investments/holdings/{id}` | Yes | Get holding with transaction history |
-| `PATCH` | `/investments/holdings/{id}` | Yes | Update holding metadata |
-| `DELETE` | `/investments/holdings/{id}` | Yes | Deactivate holding |
-| `GET` | `/investments/transactions` | Yes | List investment transactions (cursor paginated) |
-| `POST` | `/investments/transactions` | Yes | Record buy/sell/dividend/etc. |
-| `PATCH` | `/investments/transactions/{id}` | Yes | Update investment transaction |
-| `DELETE` | `/investments/transactions/{id}` | Yes | Soft-delete investment transaction |
-| `GET` | `/investments/summary` | Yes | Portfolio summary (total value, gains, allocation) |
+| `GET` | `/api/v1/investments/holdings` | Yes | List all holdings with current values |
+| `POST` | `/api/v1/investments/holdings` | Yes | Add new holding |
+| `GET` | `/api/v1/investments/holdings/{id}` | Yes | Get holding with transaction history |
+| `PATCH` | `/api/v1/investments/holdings/{id}` | Yes | Update holding metadata |
+| `DELETE` | `/api/v1/investments/holdings/{id}` | Yes | Deactivate holding |
+| `GET` | `/api/v1/investments/transactions` | Yes | List investment transactions (cursor paginated) |
+| `POST` | `/api/v1/investments/transactions` | Yes | Record buy/sell/dividend/etc. |
+| `PATCH` | `/api/v1/investments/transactions/{id}` | Yes | Update investment transaction |
+| `DELETE` | `/api/v1/investments/transactions/{id}` | Yes | Soft-delete investment transaction |
+| `GET` | `/api/v1/investments/summary` | Yes | Portfolio summary (total value, gains, allocation) |
 
-**`GET /investments/summary` Response:**
+**`GET /api/v1/investments/summary` Response:**
 
 ```json
 {
@@ -1793,22 +1936,22 @@ Response (201):
 
 | Method | Path | Auth | Rate Limit | Description |
 |--------|------|------|------------|-------------|
-| `POST` | `/screenshots/upload` | Yes | 50/day/user | Upload screenshot for parsing |
-| `GET` | `/screenshots/{id}/status` | Yes | - | Poll parsing status |
-| `GET` | `/screenshots/{id}/result` | Yes | - | Get parsed data |
-| `POST` | `/screenshots/{id}/confirm` | Yes | - | Confirm parsed data, create transaction |
+| `POST` | `/api/v1/screenshots/upload` | Yes | 10/hr/user AND 50/day/user | Upload screenshot for parsing |
+| `GET` | `/api/v1/screenshots/{id}/status` | Yes | - | Poll parsing status |
+| `GET` | `/api/v1/screenshots/{id}/result` | Yes | - | Get parsed data |
+| `POST` | `/api/v1/screenshots/{id}/confirm` | Yes | - | Confirm parsed data, create transaction |
 
 #### Dashboard
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/dashboard/summary` | Yes | Monthly income, expense, savings, balance |
-| `GET` | `/dashboard/category-breakdown` | Yes | Spending by category (for pie chart) |
-| `GET` | `/dashboard/trend` | Yes | Income/expense trend (last 12 months) |
-| `GET` | `/dashboard/budget-status` | Yes | Budget utilization for current month |
-| `GET` | `/dashboard/net-worth` | Yes | Net worth over time (accounts + investments) |
+| `GET` | `/api/v1/dashboard/summary` | Yes | Monthly income, expense, savings, balance |
+| `GET` | `/api/v1/dashboard/category-breakdown` | Yes | Spending by category (for pie chart) |
+| `GET` | `/api/v1/dashboard/trend` | Yes | Income/expense trend (last 12 months) |
+| `GET` | `/api/v1/dashboard/budget-status` | Yes | Budget utilization for current month |
+| `GET` | `/api/v1/dashboard/net-worth` | Yes | Net worth over time (accounts + investments) |
 
-**`GET /dashboard/summary` Query Parameters:**
+**`GET /api/v1/dashboard/summary` Query Parameters:**
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -1845,8 +1988,8 @@ Response (201):
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/health` | No | Basic health check (DB, Redis, S3 connectivity) |
-| `GET` | `/health/ready` | No | Readiness probe (all dependencies healthy) |
+| `GET` | `/api/v1/health` | No | Basic health check (DB, Redis, S3 connectivity) |
+| `GET` | `/api/v1/health/ready` | No | Readiness probe (all dependencies healthy) |
 
 ---
 
@@ -1895,8 +2038,10 @@ async def upload_screenshot(
     user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    # 1. Check daily rate limit (50/day/user)
-    if not await check_rate_limit(f"screenshots:{user_id}", 50, 86400):
+    # 1. Check rate limits (10/hour/user AND 50/day/user)
+    if not await check_rate_limit(f"screenshots:hourly:{user_id}", 10, 3600):
+        raise RateLimitError("Hourly screenshot limit reached (10/hour)")
+    if not await check_rate_limit(f"screenshots:daily:{user_id}", 50, 86400):
         raise RateLimitError("Daily screenshot limit reached (50/day)")
 
     # 2. Check daily API cost limit
@@ -1980,11 +2125,36 @@ def parse_screenshot(self, parse_log_id: str):
             image_bytes = download_from_s3(log.s3_key)
             image_b64 = base64.b64encode(image_bytes).decode()
 
-            # Call Claude Vision API
+            # Call Claude Vision API (tool-use mode for structured output)
             start_time = time.monotonic()
             response = anthropic_client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
+                tools=[{
+                    "name": "record_transaction",
+                    "description": "Record the parsed financial transaction from a screenshot.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "transaction_type": {"type": "string", "enum": ["expense", "income"]},
+                            "amount": {"type": "number", "description": "Amount in INR, no commas"},
+                            "description": {"type": "string"},
+                            "merchant": {"type": ["string", "null"]},
+                            "category_suggestion": {"type": "string"},
+                            "subcategory_suggestion": {"type": ["string", "null"]},
+                            "transaction_date": {"type": ["string", "null"], "description": "ISO 8601 datetime"},
+                            "payment_method": {"type": ["string", "null"], "enum": ["UPI", "NEFT", "IMPS", "card", "cash", "unknown", None]},
+                            "upi_id": {"type": ["string", "null"]},
+                            "reference_number": {"type": ["string", "null"]},
+                            "from_account": {"type": ["string", "null"]},
+                            "to_account": {"type": ["string", "null"]},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                            "error": {"type": ["string", "null"], "description": "Set to 'not_a_transaction' if not a financial screenshot"},
+                        },
+                        "required": ["transaction_type", "amount", "confidence"],
+                    },
+                }],
+                tool_choice={"type": "tool", "name": "record_transaction"},
                 messages=[{
                     "role": "user",
                     "content": [
@@ -2005,9 +2175,9 @@ def parse_screenshot(self, parse_log_id: str):
             )
             latency_ms = int((time.monotonic() - start_time) * 1000)
 
-            # Parse Claude's response
-            raw_text = response.content[0].text
-            parsed = parse_claude_response(raw_text)  # Returns Pydantic model
+            # Extract structured tool-use result (guaranteed valid JSON schema)
+            tool_block = next(b for b in response.content if b.type == "tool_use")
+            parsed = ParsedTransaction.model_validate(tool_block.input)
 
             # Update log
             log.status = "parsed"
@@ -2040,7 +2210,413 @@ def parse_screenshot(self, parse_log_id: str):
             # Don't retry validation errors
 ```
 
-### 7.3 Claude Prompt Template
+### 7.3 Vision Provider Abstraction (Multi-Model Support)
+
+The screenshot parser is designed with a **provider pattern** so you can switch between vision models (Claude, GPT-4V, Gemini Vision, etc.) without changing any business logic.
+
+```python
+# screenshots/providers/base.py
+
+from abc import ABC, abstractmethod
+from pydantic import BaseModel, Field
+from typing import Optional
+from decimal import Decimal
+
+
+class ParsedTransaction(BaseModel):
+    """Unified output schema — every provider must return this."""
+    transaction_type: str  # "expense" | "income"
+    amount: Decimal = Field(gt=0, lt=10_000_000)
+    description: Optional[str] = None
+    merchant: Optional[str] = None
+    category_suggestion: Optional[str] = None
+    subcategory_suggestion: Optional[str] = None
+    transaction_date: Optional[str] = None  # ISO 8601
+    payment_method: Optional[str] = None    # UPI, NEFT, IMPS, card, cash
+    upi_id: Optional[str] = None
+    reference_number: Optional[str] = None
+    from_account: Optional[str] = None
+    to_account: Optional[str] = None
+    confidence: float = Field(ge=0, le=1)
+    error: Optional[str] = None
+
+
+class VisionProviderResult(BaseModel):
+    """Provider response wrapper with cost/usage metadata."""
+    parsed: ParsedTransaction
+    model_name: str
+    provider: str           # "anthropic" | "openai" | "google" | "local"
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: Decimal = Decimal("0")
+    latency_ms: int = 0
+    raw_response: Optional[dict] = None  # Full API response for audit
+
+
+class VisionProvider(ABC):
+    """Abstract base class for all vision model providers."""
+
+    @abstractmethod
+    async def parse_screenshot(
+        self, image_bytes: bytes, media_type: str
+    ) -> VisionProviderResult:
+        """Parse a screenshot and return structured transaction data."""
+        ...
+
+    @abstractmethod
+    def estimate_cost(self, input_tokens: int, output_tokens: int) -> Decimal:
+        """Estimate cost in USD for a given token count."""
+        ...
+
+    @property
+    @abstractmethod
+    def provider_name(self) -> str:
+        """Return provider identifier (e.g., 'anthropic', 'openai')."""
+        ...
+
+    @property
+    @abstractmethod
+    def model_name(self) -> str:
+        """Return model identifier (e.g., 'claude-sonnet-4-20250514')."""
+        ...
+```
+
+```python
+# screenshots/providers/anthropic_provider.py
+
+import anthropic
+import time
+from decimal import Decimal
+
+class AnthropicVisionProvider(VisionProvider):
+    """Claude Vision provider (Sonnet for cost efficiency, Opus for accuracy)."""
+
+    PRICING = {
+        "claude-sonnet-4-20250514": {"input": Decimal("3.00"), "output": Decimal("15.00")},  # per 1M tokens
+        "claude-haiku-4-5-20251001": {"input": Decimal("0.80"), "output": Decimal("4.00")},
+    }
+
+    TOOL_SCHEMA = {
+        "name": "record_transaction",
+        "description": "Record the parsed financial transaction from a screenshot.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "transaction_type": {"type": "string", "enum": ["expense", "income"]},
+                "amount": {"type": "number", "description": "Amount in INR"},
+                "description": {"type": "string"},
+                "merchant": {"type": ["string", "null"]},
+                "category_suggestion": {"type": "string"},
+                "subcategory_suggestion": {"type": ["string", "null"]},
+                "transaction_date": {"type": ["string", "null"]},
+                "payment_method": {"type": ["string", "null"],
+                                   "enum": ["UPI", "NEFT", "IMPS", "card", "cash", "unknown", None]},
+                "upi_id": {"type": ["string", "null"]},
+                "reference_number": {"type": ["string", "null"]},
+                "from_account": {"type": ["string", "null"]},
+                "to_account": {"type": ["string", "null"]},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "error": {"type": ["string", "null"]},
+            },
+            "required": ["transaction_type", "amount", "confidence"],
+        },
+    }
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-20250514"):
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self._model = model
+
+    @property
+    def provider_name(self) -> str:
+        return "anthropic"
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    async def parse_screenshot(self, image_bytes: bytes, media_type: str) -> VisionProviderResult:
+        import base64
+        image_b64 = base64.b64encode(image_bytes).decode()
+
+        start = time.monotonic()
+        response = self._client.messages.create(
+            model=self._model,
+            max_tokens=1024,
+            tools=[self.TOOL_SCHEMA],
+            tool_choice={"type": "tool", "name": "record_transaction"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
+                    {"type": "text", "text": SCREENSHOT_PARSE_PROMPT},
+                ]
+            }]
+        )
+        latency_ms = int((time.monotonic() - start) * 1000)
+
+        tool_block = next(b for b in response.content if b.type == "tool_use")
+        parsed = ParsedTransaction.model_validate(tool_block.input)
+
+        return VisionProviderResult(
+            parsed=parsed,
+            model_name=response.model,
+            provider="anthropic",
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            cost_usd=self.estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
+            latency_ms=latency_ms,
+            raw_response={"id": response.id, "model": response.model},
+        )
+
+    def estimate_cost(self, input_tokens: int, output_tokens: int) -> Decimal:
+        pricing = self.PRICING.get(self._model, self.PRICING["claude-sonnet-4-20250514"])
+        return (Decimal(input_tokens) * pricing["input"] + Decimal(output_tokens) * pricing["output"]) / Decimal("1000000")
+```
+
+```python
+# screenshots/providers/openai_provider.py
+
+import openai
+import json, time
+from decimal import Decimal
+
+class OpenAIVisionProvider(VisionProvider):
+    """GPT-4o / GPT-4V provider."""
+
+    PRICING = {
+        "gpt-4o": {"input": Decimal("2.50"), "output": Decimal("10.00")},
+        "gpt-4o-mini": {"input": Decimal("0.15"), "output": Decimal("0.60")},
+    }
+
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
+        self._client = openai.OpenAI(api_key=api_key)
+        self._model = model
+
+    @property
+    def provider_name(self) -> str:
+        return "openai"
+
+    @property
+    def model_name(self) -> str:
+        return self._model
+
+    async def parse_screenshot(self, image_bytes: bytes, media_type: str) -> VisionProviderResult:
+        import base64
+        image_b64 = base64.b64encode(image_bytes).decode()
+
+        start = time.monotonic()
+        response = self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=1024,
+            response_format={"type": "json_object"},
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:{media_type};base64,{image_b64}"}},
+                    {"type": "text", "text": SCREENSHOT_PARSE_PROMPT + "\n\nRespond with valid JSON only."},
+                ]
+            }]
+        )
+        latency_ms = int((time.monotonic() - start) * 1000)
+
+        raw_json = json.loads(response.choices[0].message.content)
+        parsed = ParsedTransaction.model_validate(raw_json)
+
+        return VisionProviderResult(
+            parsed=parsed,
+            model_name=self._model,
+            provider="openai",
+            input_tokens=response.usage.prompt_tokens,
+            output_tokens=response.usage.completion_tokens,
+            cost_usd=self.estimate_cost(response.usage.prompt_tokens, response.usage.completion_tokens),
+            latency_ms=latency_ms,
+            raw_response={"id": response.id, "model": response.model},
+        )
+
+    def estimate_cost(self, input_tokens: int, output_tokens: int) -> Decimal:
+        pricing = self.PRICING.get(self._model, self.PRICING["gpt-4o"])
+        return (Decimal(input_tokens) * pricing["input"] + Decimal(output_tokens) * pricing["output"]) / Decimal("1000000")
+```
+
+```python
+# screenshots/providers/google_provider.py
+
+import google.generativeai as genai
+import json, time
+from decimal import Decimal
+
+class GeminiVisionProvider(VisionProvider):
+    """Google Gemini Vision provider."""
+
+    PRICING = {
+        "gemini-2.0-flash": {"input": Decimal("0.10"), "output": Decimal("0.40")},
+        "gemini-2.5-pro": {"input": Decimal("1.25"), "output": Decimal("10.00")},
+    }
+
+    def __init__(self, api_key: str, model: str = "gemini-2.0-flash"):
+        genai.configure(api_key=api_key)
+        self._model_name = model
+        self._model = genai.GenerativeModel(model)
+
+    @property
+    def provider_name(self) -> str:
+        return "google"
+
+    @property
+    def model_name(self) -> str:
+        return self._model_name
+
+    async def parse_screenshot(self, image_bytes: bytes, media_type: str) -> VisionProviderResult:
+        from PIL import Image
+        import io
+
+        img = Image.open(io.BytesIO(image_bytes))
+        start = time.monotonic()
+
+        response = self._model.generate_content(
+            [SCREENSHOT_PARSE_PROMPT + "\n\nRespond with valid JSON only.", img],
+            generation_config=genai.GenerationConfig(
+                response_mime_type="application/json",
+                max_output_tokens=1024,
+            ),
+        )
+        latency_ms = int((time.monotonic() - start) * 1000)
+
+        raw_json = json.loads(response.text)
+        parsed = ParsedTransaction.model_validate(raw_json)
+
+        usage = response.usage_metadata
+        return VisionProviderResult(
+            parsed=parsed,
+            model_name=self._model_name,
+            provider="google",
+            input_tokens=usage.prompt_token_count or 0,
+            output_tokens=usage.candidates_token_count or 0,
+            cost_usd=self.estimate_cost(usage.prompt_token_count or 0, usage.candidates_token_count or 0),
+            latency_ms=latency_ms,
+        )
+
+    def estimate_cost(self, input_tokens: int, output_tokens: int) -> Decimal:
+        pricing = self.PRICING.get(self._model_name, self.PRICING["gemini-2.0-flash"])
+        return (Decimal(input_tokens) * pricing["input"] + Decimal(output_tokens) * pricing["output"]) / Decimal("1000000")
+```
+
+```python
+# screenshots/providers/factory.py
+
+from app.core.config import settings
+
+def get_vision_provider() -> VisionProvider:
+    """Factory: returns the configured vision provider based on settings."""
+
+    provider = settings.VISION_PROVIDER  # "anthropic" | "openai" | "google"
+
+    if provider == "anthropic":
+        return AnthropicVisionProvider(
+            api_key=settings.ANTHROPIC_API_KEY,
+            model=settings.VISION_MODEL or "claude-sonnet-4-20250514",
+        )
+    elif provider == "openai":
+        return OpenAIVisionProvider(
+            api_key=settings.OPENAI_API_KEY,
+            model=settings.VISION_MODEL or "gpt-4o",
+        )
+    elif provider == "google":
+        return GeminiVisionProvider(
+            api_key=settings.GOOGLE_AI_API_KEY,
+            model=settings.VISION_MODEL or "gemini-2.0-flash",
+        )
+    else:
+        raise ValueError(f"Unknown vision provider: {provider}")
+```
+
+**Environment variables (.env):**
+```bash
+# Vision Provider Config
+VISION_PROVIDER=anthropic            # anthropic | openai | google
+VISION_MODEL=claude-sonnet-4-20250514  # Model within the provider
+
+# Provider API Keys (only the active provider's key is required)
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...                # Only if VISION_PROVIDER=openai
+GOOGLE_AI_API_KEY=AIza...            # Only if VISION_PROVIDER=google
+```
+
+**Usage in Celery task** (provider-agnostic):
+```python
+# tasks/screenshot_tasks.py
+
+from app.screenshots.providers.factory import get_vision_provider
+
+@celery_app.task(bind=True, queue="parsing", max_retries=2, ...)
+def parse_screenshot(self, parse_log_id: str):
+    provider = get_vision_provider()
+
+    with sync_db_session() as db:
+        log = db.get(ScreenshotParseLog, parse_log_id)
+        log.status = "processing"
+        db.commit()
+
+        try:
+            image_bytes = download_from_s3(log.s3_key)
+
+            # Provider-agnostic call — same interface regardless of model
+            import asyncio
+            result = asyncio.run(provider.parse_screenshot(image_bytes, log.media_type))
+
+            log.status = "parsed"
+            log.parsed_data = result.parsed.model_dump()
+            log.provider = result.provider          # "anthropic" | "openai" | "google"
+            log.model_used = result.model_name
+            log.input_tokens = result.input_tokens
+            log.output_tokens = result.output_tokens
+            log.cost_usd = result.cost_usd
+            log.api_latency_ms = result.latency_ms
+            log.raw_response = result.raw_response
+            log.parsed_at = datetime.utcnow()
+
+            update_daily_usage(db, log.user_id, result)
+            db.commit()
+
+        except Exception as e:
+            log.status = "failed"
+            log.error_message = str(e)
+            db.commit()
+            raise self.retry(exc=e)
+```
+
+**Tiered provider strategy** (cost optimization):
+```python
+# Optional: Use cheaper model first, fallback to expensive on low confidence
+
+async def parse_with_fallback(image_bytes: bytes, media_type: str) -> VisionProviderResult:
+    """Try cheap model first; if confidence < 0.7, retry with expensive model."""
+
+    cheap = get_vision_provider_by_name("google", "gemini-2.0-flash")  # ~$0.001/parse
+    result = await cheap.parse_screenshot(image_bytes, media_type)
+
+    if result.parsed.confidence >= 0.7:
+        return result
+
+    # Low confidence — escalate to better model
+    expensive = get_vision_provider_by_name("anthropic", "claude-sonnet-4-20250514")  # ~$0.008/parse
+    return await expensive.parse_screenshot(image_bytes, media_type)
+```
+
+**Cost comparison across providers:**
+
+| Provider | Model | Cost/Parse (approx) | Quality | Speed |
+|----------|-------|---------------------|---------|-------|
+| Google | gemini-2.0-flash | ~$0.001 | Good | Fast |
+| OpenAI | gpt-4o-mini | ~$0.002 | Good | Fast |
+| Anthropic | claude-haiku-4.5 | ~$0.003 | Good | Fast |
+| OpenAI | gpt-4o | ~$0.008 | Excellent | Medium |
+| Anthropic | claude-sonnet-4 | ~$0.008 | Excellent | Medium |
+| Google | gemini-2.5-pro | ~$0.010 | Excellent | Slower |
+
+**Recommendation:** Start with `anthropic/claude-sonnet-4` for best quality on Indian payment screenshots. Switch to `google/gemini-2.0-flash` for cost savings once you've validated quality. Use the tiered fallback strategy at scale.
+
+### 7.4 Prompt Template
 
 ```python
 SCREENSHOT_PARSE_PROMPT = """You are a financial transaction parser for an Indian personal finance app.
@@ -2179,6 +2755,10 @@ celery_app.conf.update(
     task_acks_late=True,           # Ack after completion, not receipt
     worker_prefetch_multiplier=1,  # One task at a time per worker process
     task_reject_on_worker_lost=True,
+
+    # Graceful shutdown: finish current tasks before stopping
+    worker_cancel_long_running_tasks_on_connection_loss=True,
+    worker_max_tasks_per_child=1000,  # Restart worker after 1000 tasks (prevent memory leaks)
 
     # Result expiry
     result_expires=3600,  # 1 hour
@@ -2479,10 +3059,10 @@ export default defineConfig({
   },
   server: {
     proxy: {
-      "/api": {
+      "/api/v1": {
         target: "http://localhost:8000",
         changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ""),
+        rewrite: (path) => path.replace(/^\/api\/v1/, "/api/v1"),
       },
     },
   },
@@ -2586,8 +3166,11 @@ import axios, { AxiosError, InternalAxiosRequestConfig } from "axios";
 import { useAuthStore } from "@/stores/authStore";
 
 const apiClient = axios.create({
-  baseURL: "/api",
+  baseURL: "/api/v1",
   withCredentials: true, // Send cookies (refresh token)
+  headers: {
+    "X-Requested-With": "XMLHttpRequest",
+  },
 });
 
 // Request interceptor: attach access token
@@ -2643,7 +3226,7 @@ apiClient.interceptors.response.use(
 
       try {
         const { data } = await axios.post(
-          "/api/auth/refresh",
+          "/api/v1/auth/refresh",
           {},
           { withCredentials: true }
         );
@@ -2921,7 +3504,8 @@ services:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -2969,6 +3553,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD:-devpassword}@postgres:5432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD:-devpassword}@postgres:5432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -2980,6 +3565,7 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    stop_grace_period: 30s
     command: >
       celery -A app.tasks.celery_app worker
       -Q default,parsing,prices
@@ -2995,6 +3581,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD:-devpassword}@postgres:5432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD:-devpassword}@postgres:5432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       redis:
@@ -3166,6 +3753,7 @@ services:
       target: production
     environment:
       - DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD}@pgbouncer:6432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD}@pgbouncer:6432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
@@ -3188,6 +3776,7 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    stop_grace_period: 30s
     deploy:
       resources:
         limits:
@@ -3204,6 +3793,7 @@ services:
       target: production
     environment:
       - DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD}@pgbouncer:6432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD}@pgbouncer:6432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
       - ENVIRONMENT=production
     command: >
@@ -3239,27 +3829,12 @@ volumes:
 
 yourdomain.com {
     # API routes → FastAPI backend
-    handle /api/* {
-        uri strip_prefix /api
+    handle /api/v1/* {
         reverse_proxy backend:8000 {
             header_up X-Real-IP {remote_host}
             header_up X-Forwarded-For {remote_host}
             header_up X-Forwarded-Proto {scheme}
         }
-    }
-
-    # Auth routes (no /api prefix in backend)
-    handle /auth/* {
-        reverse_proxy backend:8000 {
-            header_up X-Real-IP {remote_host}
-            header_up X-Forwarded-For {remote_host}
-            header_up X-Forwarded-Proto {scheme}
-        }
-    }
-
-    # Health check (direct, no /api prefix)
-    handle /health* {
-        reverse_proxy backend:8000
     }
 
     # Static SPA files
@@ -3516,15 +4091,27 @@ echo "[$(date)] Backup complete."
 ENVIRONMENT=development                    # development | production
 SECRET_KEY=change-me-to-64-char-random     # openssl rand -hex 32
 
+# ============ JWT (RS256 asymmetric) ============
+JWT_ALGORITHM=RS256
+JWT_PRIVATE_KEY_PATH=./keys/jwt-private.pem   # openssl genpkey -algorithm RSA -out jwt-private.pem -pkeyopt rsa_keygen_bits:2048
+JWT_PUBLIC_KEY_PATH=./keys/jwt-public.pem     # openssl rsa -in jwt-private.pem -pubout -out jwt-public.pem
+
 # ============ Database ============
 DB_PASSWORD=change-me
 DATABASE_URL=postgresql+asyncpg://expense_tracker:${DB_PASSWORD}@localhost:5432/expense_tracker
+SYNC_DATABASE_URL=postgresql://expense_tracker:${DB_PASSWORD}@localhost:5432/expense_tracker
 
 # ============ Redis ============
 REDIS_URL=redis://localhost:6379/0
 
-# ============ Claude API ============
-ANTHROPIC_API_KEY=sk-ant-...               # Anthropic API key
+# ============ Vision Provider (Screenshot Parsing) ============
+VISION_PROVIDER=anthropic                  # anthropic | openai | google
+VISION_MODEL=claude-sonnet-4-20250514      # Model within provider (optional, uses default)
+
+# Provider API Keys (only the active provider's key is required)
+ANTHROPIC_API_KEY=sk-ant-...               # Required if VISION_PROVIDER=anthropic
+OPENAI_API_KEY=sk-...                      # Required if VISION_PROVIDER=openai
+GOOGLE_AI_API_KEY=AIza...                  # Required if VISION_PROVIDER=google
 
 # ============ AWS S3 ============
 AWS_ACCESS_KEY_ID=AKIA...
@@ -3947,7 +4534,7 @@ async def readiness_check():
 | Decision | Trigger | Action |
 |----------|---------|--------|
 | **Separate database server** | CPU consistently >70% on single VM | Move PostgreSQL to its own VM or managed service. |
-| **Read replica** | Dashboard queries >500ms p95 | Route all `GET /dashboard/*` queries to read replica. |
+| **Read replica** | Dashboard queries >500ms p95 | Route all `GET /api/v1/dashboard/*` queries to read replica. |
 | **CDN for static assets** | Frontend bundle >2 MB, global users | CloudFront in front of Caddy for `*.js`, `*.css`, images. |
 | **Separate Redis instances** | Cache evictions while Celery broker is stable | One Redis for caching (volatile), one for Celery (persistent). |
 | **Materialized views** | Monthly aggregation queries >1s | Pre-computed views for dashboard summary, refreshed every 5 min. |

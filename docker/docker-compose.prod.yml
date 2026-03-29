@@ -1,0 +1,44 @@
+services:
+  backend:
+    build:
+      target: prod
+    command: ["gunicorn", "app.main:app", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:8000"]
+    volumes: []
+    environment:
+      - DEBUG=false
+    restart: unless-stopped
+
+  celery-worker:
+    build:
+      target: prod
+    volumes: []
+    restart: unless-stopped
+
+  celery-beat:
+    build:
+      target: prod
+    volumes: []
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  postgres:
+    restart: unless-stopped
+
+  redis:
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

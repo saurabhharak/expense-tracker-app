@@ -8,7 +8,9 @@
       "Bash(npx skills:*)",
       "Bash(node:*)",
       "WebFetch(domain:github.com)",
-      "Bash(echo \"exit: $?\")"
+      "Bash(echo \"exit: $?\")",
+      "Bash(npx -y @anthropic-ai/claude-code mcp add git -- npx -y @anthropic-ai/mcp-git)",
+      "Bash(npx -y @anthropic-ai/claude-code mcp add github -- npx -y @anthropic-ai/mcp-github)"
     ]
   }
 }

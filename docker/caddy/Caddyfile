@@ -1,0 +1,30 @@
+{$DOMAIN:localhost} {
+    # API reverse proxy
+    handle /api/* {
+        reverse_proxy backend:8000
+    }
+
+    # Health check (no auth)
+    handle /api/v1/health {
+        reverse_proxy backend:8000
+    }
+
+    # SPA fallback — serve frontend, fallback to index.html
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
+
+    # Security headers
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "0"
+        Referrer-Policy strict-origin-when-cross-origin
+        -Server
+    }
+
+    # Compression
+    encode gzip zstd
+}

@@ -1,0 +1,144 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: expense_tracker
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres_dev
+      POSTGRES_HOST_AUTH_METHOD: md5
+      POSTGRES_INITDB_ARGS: "--auth-host=md5"
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d expense_tracker"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres_dev@postgres:5432/expense_tracker
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 200
+      DEFAULT_POOL_SIZE: 20
+    ports:
+      - "6432:6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    ports:
+      - "9002:9000"
+      - "9003:9001"
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - APP_NAME=Expense Tracker
+      - DEBUG=true
+      - DATABASE_URL=postgresql+asyncpg://app_user:app_password_dev@pgbouncer:5432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://app_user:app_password_dev@pgbouncer:5432/expense_tracker
+      - MIGRATION_DATABASE_URL=postgresql+asyncpg://postgres:postgres_dev@postgres:5432/expense_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=expense-tracker
+      - S3_REGION=us-east-1
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../backend/app:/app/app
+      - ../backend/alembic:/app/alembic
+      - ../backend/alembic.ini:/app/alembic.ini
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  celery-worker:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - SYNC_DATABASE_URL=postgresql://app_user:app_password_dev@pgbouncer:5432/expense_tracker
+      - REDIS_URL=redis://redis:6379/0
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY=minioadmin
+      - S3_SECRET_KEY=minioadmin123
+      - S3_BUCKET_NAME=expense-tracker
+    volumes:
+      - ../backend/app:/app/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A app.tasks.celery_app worker --loglevel=info -Q default,screenshots
+
+  celery-beat:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      target: dev
+    environment:
+      - SYNC_DATABASE_URL=postgresql://app_user:app_password_dev@pgbouncer:5432/expense_tracker
+      - REDIS_URL=redis://redis:6379/0
+    volumes:
+      - ../backend/app:/app/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.tasks.celery_app beat --loglevel=info
+
+  flower:
+    image: mher/flower:latest
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  redis_data:
+  minio_data:

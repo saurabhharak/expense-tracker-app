@@ -7,10 +7,35 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.eggs/
+*.egg
 .venv/
 venv/
+
+# Environment
 .env
+*.pem
+
+# Keys
+keys/
+
+# Docker volumes
+postgres_data/
+redis_data/
+minio_data/
 
 # IDE
 .vscode/
 .idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
