@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p \"C:/Projects/Personal Expense Tracker/.claude/agents\")",
+      "Bash(mkdir -p \"C:/Projects/Personal Expense Tracker/.claude/agent-memory/reviewer\")",
+      "Bash(mkdir -p \"C:/Projects/Personal Expense Tracker/.claude/agent-memory-local\")",
+      "Bash(mkdir -p \"C:/Projects/Personal Expense Tracker/tasks\")",
+      "Bash(npx skills:*)",
+      "Bash(node:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(echo \"exit: $?\")"
+    ]
+  }
+}

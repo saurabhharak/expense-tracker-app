@@ -1,0 +1,16 @@
+# Machine-local agent memory
+.claude/agent-memory-local/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
