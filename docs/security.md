@@ -26,6 +26,7 @@
 15. [V1 Security Checklist](#15-v1-security-checklist-non-negotiable)
 16. [V1 Should-Have](#16-v1-should-have-within-first-month)
 17. [V2 Items](#17-v2-items-within-3-months)
+18. [Known Gaps and Future Work](#18-known-gaps-and-future-work)
 
 ---
 
@@ -94,10 +95,47 @@ Mobile OTP is the primary authentication method, optimized for the Indian market
 
 | Library | Purpose |
 |---|---|
-| `python-jose` | JWT creation, validation, and signing (RS256 recommended) |
+| `python-jose` | JWT creation, validation, and signing (RS256) |
 | `passlib[bcrypt]` | Password hashing (for any future password-based flows) |
 | `pyotp` | TOTP generation and verification for MFA |
 | `fastapi-limiter` | Rate limiting middleware using Redis backend |
+
+### JWT Signing (RS256 Asymmetric Keys)
+
+All JWTs **must** be signed using the RS256 algorithm with asymmetric RSA key pairs. Symmetric algorithms (e.g., HS256) are **not permitted** because they use a shared secret for both signing and verification, which increases the blast radius if the key is compromised.
+
+```python
+from jose import jwt
+from cryptography.hazmat.primitives import serialization
+
+# Load RSA private key from AWS Secrets Manager (for signing)
+private_key = serialization.load_pem_private_key(
+    private_key_pem.encode(), password=None
+)
+
+# Load RSA public key (for verification)
+public_key = serialization.load_pem_public_key(
+    public_key_pem.encode()
+)
+
+# Sign (server-side only, private key never leaves backend)
+access_token = jwt.encode(
+    {"sub": str(user_id), "role": role, "exp": expire},
+    private_key_pem,
+    algorithm="RS256",
+)
+
+# Verify (can be done by any service holding the public key)
+payload = jwt.decode(
+    access_token,
+    public_key_pem,
+    algorithms=["RS256"],
+)
+```
+
+- **Private key**: Stored in AWS Secrets Manager; used only by the auth service to sign tokens.
+- **Public key**: Distributed to any service that needs to verify tokens. Safe to share.
+- **Key rotation**: 90-day rotation with a grace period where both old and new public keys are accepted.
 
 ---
 
@@ -252,9 +290,10 @@ All rate limits are enforced via `fastapi-limiter` with a Redis backend.
 
 | Endpoint | Limit | Window | Key | Rationale |
 |---|---|---|---|---|
-| `POST /auth/otp/send` | 3 requests | 10 min | Phone number | OTP bombing prevention (SMS cost + user annoyance) |
-| `POST /auth/otp/verify` | 5 requests | 15 min | Phone number | Brute force prevention (10^6 combinations) |
-| `POST /upload/screenshot` | 10 requests | 1 hour | User ID | Cost control (Claude API calls are expensive) |
+| `POST /api/v1/auth/otp/send` | 3 requests | 10 min | Phone number | OTP bombing prevention (SMS cost + user annoyance) |
+| `POST /api/v1/auth/otp/verify` | 5 requests | 15 min | Phone number | Brute force prevention (10^6 combinations) |
+| `POST /api/v1/screenshots/upload` | 10 requests | 1 hour | User ID | Burst control (prevent rapid-fire uploads) |
+| `POST /api/v1/screenshots/parse` | 50 requests | 1 day | User ID | Cost control (Claude API calls are expensive; daily budget cap per user) |
 | `GET/POST /api/v1/*` (general) | 100 requests | 1 min | User ID | General DoS prevention |
 | `POST /api/v1/export` | 5 requests | 1 hour | User ID | Data scraping prevention |
 
@@ -798,6 +837,109 @@ These 7 items are planned for the second major release.
 - [ ] **Bug bounty program** - responsible disclosure policy and rewards
 - [ ] **SOC 2 Type II preparation** - if pursuing enterprise/B2B partnerships
 - [ ] **Cryptographic erasure automation** - fully automated account deletion pipeline with verification
+
+---
+
+## 18. Known Gaps and Future Work
+
+This section documents known security gaps, planned improvements, and architectural decisions that require future attention.
+
+### 18.1 Database Migration Security
+
+- Database migrations run as a **privileged database role** (separate from the application role) that has schema-alteration permissions. This role must never be used at runtime.
+- Migration files **must never contain secrets** (API keys, passwords, encryption keys). Secrets are injected at runtime via AWS Secrets Manager.
+- **Tested rollbacks**: Every migration must have a corresponding rollback (downgrade) script. Rollbacks must be tested in staging before any production migration.
+- Migration scripts are reviewed in PRs with the same rigor as application code.
+- The migration role's credentials are rotated on the same 90-day schedule as other database credentials.
+
+### 18.2 Security Testing Strategy
+
+The following security tests must be integrated into the CI/CD pipeline and executed on every PR:
+
+- **RLS isolation tests**: Create data as User A, attempt read/modify/delete as User B, assert failure. Cover all user-data tables.
+- **Auth fuzzing**: Fuzz authentication endpoints (OTP send, OTP verify, token refresh) with malformed inputs, expired tokens, and replayed tokens.
+- **Rate limit verification**: Automated tests that confirm rate limits are enforced correctly (send N+1 requests, assert 429 on the last).
+- **File upload attack tests**: Test with polyglot files, oversized images, decompression bombs, SVG with embedded scripts, null-byte filenames, and path traversal attempts.
+- **CSRF testing**: Verify that requests without the `X-Requested-With` header are rejected; verify SameSite cookie behavior.
+- **IDOR testing**: Automated tests that attempt to access resources using valid UUIDs belonging to other users; assert 404 responses.
+
+### 18.3 CI/CD Security Pipeline
+
+Every build and deployment must pass the following security gates:
+
+| Tool | Purpose | Failure Threshold |
+|---|---|---|
+| `pip-audit` | Python dependency vulnerability scanning | HIGH or CRITICAL |
+| `npm audit` | JavaScript dependency vulnerability scanning | HIGH or CRITICAL |
+| Trivy | Docker image scanning for OS and library vulnerabilities | HIGH or CRITICAL |
+| Bandit | Static Application Security Testing (SAST) for Python | Medium confidence and above |
+| trufflehog | Secret detection in code and git history | Any finding |
+
+- All gates must pass before a PR can be merged.
+- Security scan results are archived as CI artifacts for audit purposes.
+- Nightly full scans (not just diff-based) run against the main branch.
+
+### 18.4 Screenshot Parse Error Recovery
+
+When screenshot parsing fails (LLM error, timeout, malformed response), the system must provide a clear recovery path:
+
+- **Retry endpoint**: `POST /api/v1/screenshots/{id}/retry` allows users to re-trigger parsing for a failed screenshot.
+- **Maximum retries**: 3 retry attempts per screenshot. After 3 failures, the screenshot is marked as `parse_failed` and the user is prompted to enter the transaction manually.
+- **Clear error messages**: The API returns user-friendly error messages indicating why parsing failed (e.g., "Image too blurry", "Unsupported payment app format", "Service temporarily unavailable") without leaking internal details.
+- **Status tracking**: Each screenshot has a `parse_status` field: `pending`, `processing`, `completed`, `failed`, `retry_pending`.
+- Failed parses are logged in the audit log for monitoring LLM reliability trends.
+
+### 18.5 Notification Security
+
+- **V1: In-app polling only**. The frontend polls `GET /api/v1/notifications` at a reasonable interval (30 seconds). No push notifications, no WebSockets, no email notifications in V1.
+- **Email notifications (future)**: When email is added, the sending domain must have **SPF**, **DKIM**, and **DMARC** records properly configured to prevent spoofing and improve deliverability.
+- **No PII in notifications**: Notification messages must never contain financial amounts, UPI IDs, account numbers, or other PII. Use generic references (e.g., "Your recent transaction has been processed") with a link to view details in-app after authentication.
+- Notification preferences are user-configurable with granular opt-in/opt-out.
+
+### 18.6 PWA and Offline Security
+
+- **No financial data in service worker cache**: The service worker must only cache static assets (HTML, CSS, JS, images). API responses containing financial data, transactions, or user PII must **never** be cached by the service worker.
+- **Cache-Control on API responses**: All API endpoints must return `Cache-Control: no-store` to prevent browsers and intermediary proxies from caching sensitive financial data.
+- **Offline mode**: If offline support is added in the future, any locally stored data must be encrypted using the Web Crypto API with a key derived from the user's session. Local data must be cleared on logout.
+- Service worker updates must be forced (skip waiting) to ensure security patches are applied immediately.
+
+### 18.7 Search Query Security
+
+- **pg_trgm extension**: Use PostgreSQL's `pg_trgm` extension for fuzzy text search on transaction descriptions and payee names. This avoids the need for external search services that would require sending user data outside the database.
+- **RLS enforced**: All search queries pass through the same RLS policies as regular queries. A user can only search their own data.
+- **Sanitize input**: Search input is sanitized to prevent PostgreSQL pattern injection. Special characters (`%`, `_`, `\`) are escaped before use in `LIKE`/`ILIKE` queries.
+- **Parameterized queries only**: All search queries use parameterized queries via SQLAlchemy. No string interpolation or concatenation with user-supplied search terms.
+- Search results are paginated (max 50 per page) to prevent data exfiltration via overly broad queries.
+
+### 18.8 Admin Panel Security
+
+- **Separate subdomain**: The admin panel is hosted on a separate subdomain (e.g., `admin.expenses.yourdomain.com`) with its own CORS policy. This isolates admin functionality from the user-facing application.
+- **MFA required**: All admin accounts must have TOTP-based MFA enabled. Admin login without MFA is not permitted.
+- **Audit logged**: Every admin action (view user data, modify configuration, trigger exports, etc.) is logged in the `audit_logs` table with the admin's user_id, action, and target resource.
+- **4-eyes principle**: Destructive admin operations (account deletion override, data purge, configuration changes affecting security) require approval from a second administrator before execution.
+- **Shorter token lifetime**: Admin JWT access tokens have a 5-minute lifetime (vs. 15 minutes for regular users) to reduce the window of a compromised admin session.
+- Admin sessions are terminated after 30 minutes of inactivity.
+
+### 18.9 DPDPA Age Verification
+
+Under DPDPA 2023, processing children's data (under 18) requires verifiable parental consent. To avoid this complexity, the application restricts access to users aged 18 and above.
+
+- **`date_of_birth` field**: Collected at signup and encrypted at rest using Fernet encryption (same as other PII columns).
+- **Age verification**: The backend computes age from `date_of_birth` and verifies `age >= 18` before allowing account creation.
+- **`is_age_verified` boolean**: Stored on the user record. Set to `true` after successful age verification. Users cannot access the application until this flag is `true`.
+- **Clear DOB after verification**: Once age is verified and `is_age_verified` is set to `true`, the `date_of_birth` value is **deleted** (set to NULL) from the database. The application only needs to know that the user passed the age check, not their actual date of birth. This follows the data minimization principle.
+- Re-verification is not required unless the user's account is flagged for review.
+
+### 18.10 Investment Data Source Security
+
+If investment tracking or market data features are added in the future, external financial data APIs introduce additional attack surface:
+
+- **TLS + certificate validation**: All connections to external data sources must use TLS with full certificate validation. Certificate pinning is recommended for critical data providers.
+- **Circuit breakers**: Implement circuit breaker patterns (e.g., using `tenacity` or `pybreaker`) to prevent cascading failures if an external data source becomes unavailable or starts returning errors.
+- **Cache responses**: Cache market data responses with appropriate TTLs (e.g., 5 minutes for stock prices, 24 hours for mutual fund NAVs) to reduce dependency on external services and limit the impact of rate limits or outages.
+- **Fallback chain**: Define a priority-ordered list of data sources. If the primary source fails, automatically fall back to secondary sources. Log all fallback events for monitoring.
+- External API keys for data sources follow the same secrets management practices as other API keys (AWS Secrets Manager, 90-day rotation).
+- Rate limit outbound requests to data providers to stay within their usage terms and prevent accidental abuse.
 
 ---
 
