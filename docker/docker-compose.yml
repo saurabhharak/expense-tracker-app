@@ -70,8 +70,8 @@ services:
     environment:
       - APP_NAME=Expense Tracker
       - DEBUG=true
-      - DATABASE_URL=postgresql+asyncpg://postgres:postgres_dev@pgbouncer:5432/expense_tracker
-      - SYNC_DATABASE_URL=postgresql://postgres:postgres_dev@pgbouncer:5432/expense_tracker
+      - DATABASE_URL=postgresql+asyncpg://app_user:app_password_dev@pgbouncer:5432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://app_user:app_password_dev@pgbouncer:5432/expense_tracker
       - MIGRATION_DATABASE_URL=postgresql+asyncpg://postgres:postgres_dev@postgres:5432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
       - S3_ENDPOINT_URL=http://minio:9000
@@ -98,7 +98,7 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - SYNC_DATABASE_URL=postgresql://postgres:postgres_dev@pgbouncer:5432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://app_user:app_password_dev@pgbouncer:5432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
       - S3_ENDPOINT_URL=http://minio:9000
       - S3_ACCESS_KEY=minioadmin
@@ -119,7 +119,7 @@ services:
       dockerfile: Dockerfile
       target: dev
     environment:
-      - SYNC_DATABASE_URL=postgresql://postgres:postgres_dev@pgbouncer:5432/expense_tracker
+      - SYNC_DATABASE_URL=postgresql://app_user:app_password_dev@pgbouncer:5432/expense_tracker
       - REDIS_URL=redis://redis:6379/0
     volumes:
       - ../backend/app:/app/app
