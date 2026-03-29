@@ -1,9 +1,13 @@
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import text
+from starlette.responses import JSONResponse
 
 from app.core.config import settings
 from app.core.database import async_engine
@@ -11,6 +15,8 @@ from app.core.exceptions import AppException, app_exception_handler, http_except
 from app.core.middleware import RequestIDMiddleware, SecurityHeadersMiddleware, TimingMiddleware
 from app.core.redis import close_redis, get_redis, init_redis
 from app.core.storage import ensure_bucket_exists, get_s3_client
+
+limiter = Limiter(key_func=get_remote_address)
 
 logger = structlog.get_logger()
 
@@ -53,7 +59,11 @@ def create_app() -> FastAPI:
         redoc_url="/api/v1/redoc" if settings.DEBUG else None,
     )
 
+    # ── Rate limiter state ──
+    app.state.limiter = limiter
+
     # ── Exception handlers ──
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
     app.add_exception_handler(AppException, app_exception_handler)
     app.add_exception_handler(HTTPException, http_exception_handler)
 
@@ -71,7 +81,8 @@ def create_app() -> FastAPI:
 
     # ── Health endpoint ──
     @app.get(f"{settings.API_V1_PREFIX}/health")
-    async def health_check():
+    @limiter.limit("60/minute")
+    async def health_check(request: Request):
         checks = {"db": False, "redis": False, "s3": False}
         try:
             async with async_engine.connect() as conn:
@@ -96,8 +107,13 @@ def create_app() -> FastAPI:
 
         all_healthy = all(checks.values())
         any_healthy = any(checks.values())
-        status = "healthy" if all_healthy else ("degraded" if any_healthy else "unhealthy")
-        return {"status": status, "checks": checks}
+        if all_healthy:
+            status, http_status = "healthy", 200
+        elif any_healthy:
+            status, http_status = "degraded", 207
+        else:
+            status, http_status = "unhealthy", 503
+        return JSONResponse(status_code=http_status, content={"status": status, "checks": checks})
 
     return app
 

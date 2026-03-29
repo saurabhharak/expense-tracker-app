@@ -16,3 +16,4 @@ anthropic==0.42.*
 pillow==11.*
 structlog==24.*
 python-multipart==0.0.*
+slowapi==0.1.*
