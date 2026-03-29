@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SubagentStop": [
+      {
+        "matcher": "coder",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"decision\":\"block\",\"reason\":\"Code review pending. Use the reviewer agent to review the changes before proceeding.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}
