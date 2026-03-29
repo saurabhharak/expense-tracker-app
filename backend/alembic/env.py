@@ -11,8 +11,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Override URL from environment if available
-db_url = os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url"))
+# Migrations connect directly to Postgres (not PgBouncer).
+# PgBouncer doesn't support asyncpg's protocol features needed for DDL.
+db_url = os.getenv(
+    "MIGRATION_DATABASE_URL",
+    os.getenv("DATABASE_URL", config.get_main_option("sqlalchemy.url")),
+)
 # Ensure async driver for online migrations
 if db_url and "asyncpg" not in db_url:
     db_url = db_url.replace("postgresql://", "postgresql+asyncpg://")

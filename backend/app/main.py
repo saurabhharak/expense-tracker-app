@@ -77,8 +77,8 @@ def create_app() -> FastAPI:
             async with async_engine.connect() as conn:
                 await conn.execute(text("SELECT 1"))
             checks["db"] = True
-        except Exception:
-            pass
+        except Exception as e:
+            await logger.awarning("health_db_failed", error=str(e))
 
         try:
             redis = get_redis()
