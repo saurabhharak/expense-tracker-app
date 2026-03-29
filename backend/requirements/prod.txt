@@ -1,0 +1,4 @@
+-r base.txt
+gunicorn==23.*
+sentry-sdk[fastapi,sqlalchemy,celery]==2.*
+prometheus-fastapi-instrumentator==7.*
