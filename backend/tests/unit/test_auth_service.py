@@ -200,6 +200,9 @@ class TestRotateRefreshToken:
                 ip_address="127.0.0.1",
             )
 
+        # Verify family revocation was called (bulk UPDATE for all user tokens)
+        assert mock_session.execute.call_count >= 2  # lookup + bulk revoke
+
     @pytest.mark.asyncio
     async def test_raises_on_expired_token(self, rsa_keys):
         expired_token = MagicMock()
