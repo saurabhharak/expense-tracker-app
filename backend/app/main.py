@@ -79,6 +79,10 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ── Routers ──
+    from app.auth.router import router as auth_router
+    app.include_router(auth_router, prefix=settings.API_V1_PREFIX)
+
     # ── Health endpoint ──
     @app.get(f"{settings.API_V1_PREFIX}/health")
     @limiter.limit("60/minute")
