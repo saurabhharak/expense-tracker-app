@@ -34,10 +34,17 @@ class Settings(BaseSettings):
     # ── Google OAuth2 ──
     GOOGLE_CLIENT_ID: str = ""
     GOOGLE_CLIENT_SECRET: str = ""
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/api/v1/auth/google/callback"
 
     # ── MSG91 ──
     MSG91_AUTH_KEY: str = ""
     MSG91_TEMPLATE_ID: str = ""
+
+    # ── Frontend ──
+    FRONTEND_URL: str = "http://localhost:5173"
+
+    # ── Refresh Token ──
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     # ── Anthropic ──
     ANTHROPIC_API_KEY: str = ""
