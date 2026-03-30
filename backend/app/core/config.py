@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     JWT_PUBLIC_KEY_PATH: str = "./keys/jwt_public.pem"
     JWT_ALGORITHM: str = "RS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     # ── Google OAuth2 ──
     GOOGLE_CLIENT_ID: str = ""
