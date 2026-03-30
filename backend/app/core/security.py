@@ -3,6 +3,7 @@
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from uuid import UUID
 
 from jose import JWTError, jwt
@@ -10,6 +11,7 @@ from jose import JWTError, jwt
 from app.core.config import settings
 
 
+@lru_cache(maxsize=2)
 def _load_key(path: str) -> str:
     with open(path) as f:
         return f.read()

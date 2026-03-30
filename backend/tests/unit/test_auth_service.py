@@ -39,6 +39,7 @@ class TestFindOrCreateGoogleUser:
     async def test_creates_new_user_when_not_found(self):
         """If no user with this google_id exists, create one."""
         mock_session = AsyncMock()
+        mock_session.add = MagicMock()  # add() is sync, not async
         # First query (by google_id) returns None
         mock_result_1 = MagicMock()
         mock_result_1.scalar_one_or_none.return_value = None
@@ -123,6 +124,7 @@ class TestIssueTokenPair:
         user.email = "user@test.com"
 
         mock_session = AsyncMock()
+        mock_session.add = MagicMock()  # add() is sync, not async
 
         access_token, refresh_token_raw = await issue_token_pair(
             session=mock_session,
