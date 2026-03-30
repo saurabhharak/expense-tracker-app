@@ -50,3 +50,30 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+
+
+@pytest.fixture
+def rsa_keys(tmp_path, monkeypatch):
+    """Generate ephemeral RSA keys and patch settings to use them."""
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        serialization.Encoding.PEM,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    priv_path = tmp_path / "jwt_private.pem"
+    pub_path = tmp_path / "jwt_public.pem"
+    priv_path.write_bytes(private_pem)
+    pub_path.write_bytes(public_pem)
+
+    monkeypatch.setattr("app.core.config.settings.JWT_PRIVATE_KEY_PATH", str(priv_path))
+    monkeypatch.setattr("app.core.config.settings.JWT_PUBLIC_KEY_PATH", str(pub_path))
+    return str(priv_path), str(pub_path)
