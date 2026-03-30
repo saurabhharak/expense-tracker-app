@@ -50,3 +50,35 @@ async def client(app):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+
+
+@pytest.fixture
+def rsa_keys(tmp_path, monkeypatch):
+    """Generate a temporary RSA key pair and patch settings to use them.
+
+    Tests that call create_access_token (which reads keys from disk) need
+    this fixture to avoid depending on real key files.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    private_key_path = tmp_path / "jwt_private.pem"
+    public_key_path = tmp_path / "jwt_public.pem"
+    private_key_path.write_bytes(private_pem)
+    public_key_path.write_bytes(public_pem)
+
+    monkeypatch.setattr("app.core.config.settings.JWT_PRIVATE_KEY_PATH", str(private_key_path))
+    monkeypatch.setattr("app.core.config.settings.JWT_PUBLIC_KEY_PATH", str(public_key_path))
+
+    return {"private_key_path": str(private_key_path), "public_key_path": str(public_key_path)}
