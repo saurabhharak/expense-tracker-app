@@ -15,8 +15,8 @@ def _load_key(path: str) -> str:
         return f.read()
 
 
-def create_access_token(user_id: UUID, email: str | None = None) -> str:
-    """Create a signed JWT access token."""
+def create_access_token(user_id: UUID) -> str:
+    """Create a signed JWT access token. Only contains user_id (no PII)."""
     now = datetime.now(timezone.utc)
     payload: dict = {
         "sub": str(user_id),
@@ -24,8 +24,6 @@ def create_access_token(user_id: UUID, email: str | None = None) -> str:
         "iat": now,
         "exp": now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES),
     }
-    if email:
-        payload["email"] = email
     private_key = _load_key(settings.JWT_PRIVATE_KEY_PATH)
     return jwt.encode(payload, private_key, algorithm=settings.JWT_ALGORITHM)
 

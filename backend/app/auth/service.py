@@ -77,7 +77,7 @@ async def issue_token_pair(
         (access_token, refresh_token_raw) — refresh_token_raw is the
         unhashed value that goes into the cookie.
     """
-    access_token = create_access_token(user_id=user.id, email=user.email)
+    access_token = create_access_token(user_id=user.id)
 
     refresh_raw = generate_refresh_token()
     refresh_record = RefreshToken(

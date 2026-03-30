@@ -13,7 +13,7 @@ class TestGetCurrentUser:
         from app.core.security import create_access_token
 
         user_id = uuid.uuid4()
-        token = create_access_token(user_id=user_id, email="test@test.com")
+        token = create_access_token(user_id=user_id)
 
         request = MagicMock()
         request.headers = {"Authorization": f"Bearer {token}"}

@@ -15,6 +15,7 @@ from app.auth.service import (
 )
 from app.core.config import settings
 from app.core.database import get_db_session
+from app.core.limiter import limiter
 from app.core.redis import get_redis
 
 logger = structlog.get_logger()
@@ -50,6 +51,7 @@ def _clear_refresh_cookie(response: JSONResponse) -> None:
 
 
 @router.get("/google", response_model=GoogleAuthURLResponse)
+@limiter.limit("20/minute")
 async def google_auth_redirect(request: Request):
     """Return Google OAuth2 authorization URL. Frontend redirects user there."""
     url, state = build_google_auth_url()
@@ -62,6 +64,7 @@ async def google_auth_redirect(request: Request):
 
 
 @router.get("/google/callback")
+@limiter.limit("10/minute")
 async def google_callback(
     request: Request,
     code: str,
@@ -86,8 +89,8 @@ async def google_callback(
     async with get_db_session() as session:
         try:
             user, created = await find_or_create_google_user(session, google_info)
-        except ValueError as e:
-            raise HTTPException(status_code=403, detail=str(e))
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Authentication failed")
 
         user_agent = request.headers.get("User-Agent")
         ip_address = request.client.host if request.client else None
@@ -123,6 +126,7 @@ async def google_callback(
 
 
 @router.post("/refresh")
+@limiter.limit("30/minute")
 async def refresh_token(
     request: Request,
     refresh_token: str | None = Cookie(None, alias=REFRESH_COOKIE_NAME),
@@ -145,7 +149,7 @@ async def refresh_token(
         except ValueError as e:
             error_msg = str(e)
             if "reuse detected" in error_msg:
-                await logger.awarning("refresh_token_reuse", ip=ip_address)
+                await logger.awarning("refresh_token_reuse")
             raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     response = JSONResponse(
@@ -156,6 +160,7 @@ async def refresh_token(
 
 
 @router.post("/logout")
+@limiter.limit("10/minute")
 async def logout(
     request: Request,
     user_id: str = Depends(get_current_user),

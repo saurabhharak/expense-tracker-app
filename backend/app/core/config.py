@@ -44,9 +44,6 @@ class Settings(BaseSettings):
     # ── Frontend ──
     FRONTEND_URL: str = "http://localhost:5173"
 
-    # ── Refresh Token ──
-    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
-
     # ── Anthropic ──
     ANTHROPIC_API_KEY: str = ""
     CLAUDE_MODEL: str = "claude-sonnet-4-20250514"

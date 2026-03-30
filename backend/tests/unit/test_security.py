@@ -15,18 +15,13 @@ class TestCreateAccessToken:
 
     def test_contains_expected_claims(self, rsa_keys):
         user_id = uuid.uuid4()
-        token = create_access_token(user_id=user_id, email="test@example.com")
+        token = create_access_token(user_id=user_id)
         payload = decode_access_token(token)
         assert payload["sub"] == str(user_id)
-        assert payload["email"] == "test@example.com"
         assert payload["type"] == "access"
         assert "iat" in payload
         assert "exp" in payload
-
-    def test_omits_email_when_none(self, rsa_keys):
-        token = create_access_token(user_id=uuid.uuid4())
-        payload = decode_access_token(token)
-        assert "email" not in payload
+        assert "email" not in payload  # No PII in JWT per DPDPA 2023
 
 
 class TestDecodeAccessToken:

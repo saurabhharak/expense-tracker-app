@@ -3,9 +3,8 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from sqlalchemy import text
 from starlette.responses import JSONResponse
 
@@ -13,10 +12,9 @@ from app.core.config import settings
 from app.core.database import async_engine
 from app.core.exceptions import AppException, app_exception_handler, http_exception_handler
 from app.core.middleware import RequestIDMiddleware, SecurityHeadersMiddleware, TimingMiddleware
+from app.core.limiter import limiter
 from app.core.redis import close_redis, get_redis, init_redis
 from app.core.storage import ensure_bucket_exists, get_s3_client
-
-limiter = Limiter(key_func=get_remote_address)
 
 logger = structlog.get_logger()
 
