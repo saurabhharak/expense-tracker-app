@@ -93,3 +93,5 @@ class TestLogoutEndpoint:
         assert response.status_code == 200
         set_cookie = response.headers.get("set-cookie", "")
         assert "refresh_token" in set_cookie
+        # Verify cookie is actually cleared (max-age=0 or expires in past)
+        assert 'Max-Age=0' in set_cookie or "max-age=0" in set_cookie

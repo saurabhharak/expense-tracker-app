@@ -79,7 +79,7 @@ async def google_callback(
     try:
         google_info = await exchange_google_code(code)
     except ValueError as e:
-        await logger.awarning("google_oauth_failed", error=str(e))
+        await logger.awarning("google_oauth_failed")
         raise HTTPException(status_code=400, detail="Google authentication failed")
 
     # Find or create user
