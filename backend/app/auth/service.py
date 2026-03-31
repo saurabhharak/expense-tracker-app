@@ -65,6 +65,36 @@ async def find_or_create_google_user(
     return user, True
 
 
+async def find_or_create_phone_user(
+    session: AsyncSession,
+    phone: str,
+) -> tuple[User, bool]:
+    """Find existing user by phone or create a new one.
+
+    Returns:
+        (user, created) — created is True if a new user was inserted.
+    """
+    result = await session.execute(
+        select(User).where(User.phone == phone)
+    )
+    user = result.scalar_one_or_none()
+    if user:
+        if not user.is_active:
+            raise ValueError("Account is deactivated")
+        return user, False
+
+    # Create new user with phone
+    user = User(
+        phone=phone,
+        full_name="",  # Will be set later via profile update
+        phone_verified=True,
+    )
+    session.add(user)
+    await session.flush()
+    await logger.ainfo("user_created_via_otp", user_id=str(user.id))
+    return user, True
+
+
 async def issue_token_pair(
     session: AsyncSession,
     user: User,

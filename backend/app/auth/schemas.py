@@ -34,3 +34,32 @@ class GoogleAuthURLResponse(BaseModel):
 class AuthErrorResponse(BaseModel):
     success: bool = False
     error: dict
+
+
+class OtpRequestSchema(BaseModel):
+    phone: str = Field(
+        ...,
+        pattern=r"^\+91\d{10}$",
+        description="Indian phone in E.164 format: +91XXXXXXXXXX",
+        examples=["+919876543210"],
+    )
+
+
+class OtpVerifySchema(BaseModel):
+    phone: str = Field(
+        ...,
+        pattern=r"^\+91\d{10}$",
+        description="Indian phone in E.164 format: +91XXXXXXXXXX",
+        examples=["+919876543210"],
+    )
+    otp: str = Field(
+        ...,
+        pattern=r"^\d{6}$",
+        description="6-digit OTP code",
+        examples=["482901"],
+    )
+
+
+class OtpSentResponse(BaseModel):
+    message: str = "OTP sent"
+    expires_in: int = 300
