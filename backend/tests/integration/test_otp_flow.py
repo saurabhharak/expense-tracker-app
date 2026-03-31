@@ -54,8 +54,10 @@ def _make_mock_redis():
     # pipeline() is a synchronous call in the real Redis client,
     # so we use MagicMock (not AsyncMock) to avoid returning a coroutine.
     mock_pipe = AsyncMock()
-    mock_pipe.execute.return_value = [None, None, 1, None]
+    mock_pipe.execute.return_value = [None, 1]  # [zremrangebyscore, zcard=1]
     mock_redis.pipeline = MagicMock(return_value=mock_pipe)
+    mock_redis.zadd = AsyncMock()
+    mock_redis.expire = AsyncMock()
 
     return mock_redis, store
 
@@ -155,7 +157,7 @@ class TestOtpFlow:
         # Override pipeline to simulate rate limit exceeded.
         # count=4 > limit=3 → check_rate_limit returns False → 429
         mock_pipe = AsyncMock()
-        mock_pipe.execute.return_value = [None, None, 4, None]
+        mock_pipe.execute.return_value = [None, 4]  # count=4 >= limit=3
         mock_redis.pipeline = MagicMock(return_value=mock_pipe)
 
         with patch("app.auth.router.get_redis", return_value=mock_redis):

@@ -193,12 +193,14 @@ async def request_otp(request: Request, body: OtpRequestSchema):
         raise HTTPException(status_code=429, detail="Too many OTP requests. Try again later.")
 
     otp = generate_otp()
-    await store_otp(redis, body.phone, otp)
 
     try:
         await send_otp_sms(body.phone, otp)
     except ValueError:
         raise HTTPException(status_code=502, detail="Failed to send OTP. Try again later.")
+
+    # Store AFTER successful SMS delivery — avoids wasting rate-limit slots on failures
+    await store_otp(redis, body.phone, otp)
 
     await logger.ainfo("otp_requested", phone_last4=body.phone[-4:])
 

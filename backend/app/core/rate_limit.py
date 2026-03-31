@@ -10,6 +10,8 @@ async def check_rate_limit(redis: Redis, key: str, limit: int, window_seconds: i
 
     Uses a Redis sorted set where each entry is a timestamp.
     Entries outside the window are pruned on each check.
+    Only adds a timestamp when the request is allowed (denied requests
+    don't consume rate-limit slots).
 
     Args:
         redis: Async Redis client.
@@ -21,14 +23,18 @@ async def check_rate_limit(redis: Redis, key: str, limit: int, window_seconds: i
         True if request is allowed, False if rate limited.
     """
     now = time.time()
+
+    # Step 1: Prune expired entries and count current window
     pipe = redis.pipeline()
-
     pipe.zremrangebyscore(key, 0, now - window_seconds)
-    pipe.zadd(key, {f"{now}": now})
     pipe.zcard(key)
-    pipe.expire(key, window_seconds)
-
     results = await pipe.execute()
-    count = results[2]
+    count = results[1]
 
-    return count <= limit
+    if count >= limit:
+        return False
+
+    # Step 2: Only add timestamp when allowing the request
+    await redis.zadd(key, {f"{now}": now})
+    await redis.expire(key, window_seconds)
+    return True
