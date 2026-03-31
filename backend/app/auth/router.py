@@ -1,4 +1,4 @@
-"""Auth endpoints: Google OAuth2, token refresh, logout."""
+"""Auth endpoints: Google OAuth2, OTP phone auth, token refresh, logout."""
 
 import structlog
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request
