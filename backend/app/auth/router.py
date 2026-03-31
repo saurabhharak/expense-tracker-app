@@ -1,4 +1,4 @@
-"""Auth endpoints: Google OAuth2, token refresh, logout."""
+"""Auth endpoints: Google OAuth2, OTP phone auth, token refresh, logout."""
 
 import structlog
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Request
@@ -6,9 +6,11 @@ from fastapi.responses import JSONResponse
 
 from app.auth.dependencies import get_current_user
 from app.auth.oauth import build_google_auth_url, exchange_google_code
-from app.auth.schemas import GoogleAuthURLResponse, TokenResponse, UserResponse
+from app.auth.otp import generate_otp, send_otp_sms, store_otp, verify_otp_from_redis
+from app.auth.schemas import GoogleAuthURLResponse, OtpRequestSchema, OtpSentResponse, OtpVerifySchema, TokenResponse, UserResponse
 from app.auth.service import (
     find_or_create_google_user,
+    find_or_create_phone_user,
     issue_token_pair,
     revoke_refresh_token,
     rotate_refresh_token,
@@ -16,6 +18,7 @@ from app.auth.service import (
 from app.core.config import settings
 from app.core.database import get_db_session
 from app.core.limiter import limiter
+from app.core.rate_limit import check_rate_limit
 from app.core.redis import get_redis
 
 logger = structlog.get_logger()
@@ -175,4 +178,88 @@ async def logout(
     _clear_refresh_cookie(response)
 
     await logger.ainfo("user_logged_out", user_id=user_id)
+    return response
+
+
+@router.post("/otp/request")
+@limiter.limit("10/minute")
+async def request_otp(request: Request, body: OtpRequestSchema):
+    """Send a 6-digit OTP to the given phone number."""
+    redis = get_redis()
+
+    # Phone-specific rate limit: 3 per 10 minutes
+    allowed = await check_rate_limit(redis, f"otp_send:{body.phone}", limit=3, window_seconds=600)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many OTP requests. Try again later.")
+
+    otp = generate_otp()
+    await store_otp(redis, body.phone, otp)
+
+    try:
+        await send_otp_sms(body.phone, otp)
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Failed to send OTP. Try again later.")
+
+    await logger.ainfo("otp_requested", phone_last4=body.phone[-4:])
+
+    return JSONResponse(
+        content={"success": True, "data": OtpSentResponse().model_dump()},
+    )
+
+
+@router.post("/otp/verify")
+@limiter.limit("10/minute")
+async def verify_otp(request: Request, body: OtpVerifySchema):
+    """Verify OTP and issue tokens. Auto-creates account on first verification."""
+    redis = get_redis()
+
+    # Phone-specific rate limit: 5 verify attempts per 15 minutes
+    allowed = await check_rate_limit(redis, f"otp_verify:{body.phone}", limit=5, window_seconds=900)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Too many verification attempts. Try again later.")
+
+    try:
+        is_valid = await verify_otp_from_redis(redis, body.phone, body.otp)
+    except ValueError as e:
+        error_msg = str(e)
+        if "Too many attempts" in error_msg:
+            raise HTTPException(status_code=429, detail="OTP invalidated due to too many attempts")
+        raise HTTPException(status_code=401, detail="OTP expired or not requested")
+
+    if not is_valid:
+        raise HTTPException(status_code=401, detail="Invalid OTP")
+
+    # OTP valid — find or create user, issue tokens
+    async with get_db_session() as session:
+        try:
+            user, created = await find_or_create_phone_user(session, body.phone)
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Authentication failed")
+
+        user_agent = request.headers.get("User-Agent")
+        ip_address = request.client.host if request.client else None
+
+        access_token, refresh_raw = await issue_token_pair(
+            session=session,
+            user=user,
+            user_agent=user_agent,
+            ip_address=ip_address,
+        )
+
+        user_data = UserResponse.model_validate(user)
+
+    response_data = TokenResponse(
+        access_token=access_token,
+        token_type="bearer",
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        user=user_data,
+    )
+
+    response = JSONResponse(
+        status_code=201 if created else 200,
+        content={"success": True, "data": response_data.model_dump(mode="json")},
+    )
+    _set_refresh_cookie(response, refresh_raw)
+
+    await logger.ainfo("otp_auth_success", user_id=str(user.id), created=created)
     return response
